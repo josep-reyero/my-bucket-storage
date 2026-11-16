@@ -576,6 +576,15 @@ uv run --python 3.14 pytest   # on another Python (3.14 uses compression.zstd)
 uv run python bench/bench_space.py
 ```
 
+
+## Related projects
+
+This is one piece of a small family of projects that work together or on their own:
+
+- [my-easy-software](https://github.com/josep-reyero/my-easy-software): the framework: create, run, deploy and share small personal projects with the `mes` command.
+- [my-easy-ui](https://github.com/josep-reyero/my-easy-ui): dashboards: plain description files a person or their AI agent can reshape, served privately.
+- [fitdata-garmin](https://github.com/josep-reyero/fitdata-garmin): the first project built this way: a personal Garmin data archive with a command line for agents.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
