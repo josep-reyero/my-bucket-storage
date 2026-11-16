@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.pytest_cache/
+config.toml
+*.sqlite
+docs/design-draft.md
+.hypothesis/
+.ruff_cache/

@@ -1,0 +1,38 @@
+[project]
+name = "my-bucket-storage"
+version = "0.1.0"
+description = "A small S3-like object store for your own apps: SQLite plus zstd, no server process, no lock-in."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "backports.zstd; python_version < '3.14'",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX",
+    "Topic :: Database",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.scripts]
+mybucket = "mybucket.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "zstandard>=0.25.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mybucket"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
