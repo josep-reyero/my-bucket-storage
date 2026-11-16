@@ -54,7 +54,8 @@ Internal for siblings:
         autocommit connection (isolation_level=None) with mybucket pragmas;
         callers issue BEGIN IMMEDIATE / COMMIT themselves.
     create_db(path, trash_days) -> None    new bucket database (file mode 0600)
-    check_db(conn) -> dict                  validates format; returns meta table
+    check_db(conn) -> dict                  validates format and schema; returns meta table
+    check_schema(conn, fmt) -> None         UnsafeStore unless the schema is exactly mybucket's
     upgrade_db(conn) -> bool                format 1 -> 2 (True if it upgraded); takes the write lock
     has_table(conn, name) -> bool
     translate_sqlite_error(exc, what) -> MyBucketError
@@ -70,7 +71,9 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from .errors import Busy, DiskFull, MyBucketError, NotAStore, StoreError, UnsupportedFormat
+import re
+
+from .errors import Busy, DiskFull, MyBucketError, NotAStore, StoreError, UnsafeStore, UnsupportedFormat
 
 FORMAT_VERSION = 2
 #: PRAGMA application_id of every bucket database: ASCII "mybk".
@@ -146,7 +149,7 @@ CREATE INDEX IF NOT EXISTS blobs_dict ON blobs(dict_id) WHERE dict_id IS NOT NUL
 """
 
 UNREFERENCED_BLOBS_SQL = """
-SELECT b.id, b.hash, b.data IS NULL AS in_file FROM blobs b
+SELECT b.id, CAST(b.hash AS BLOB) AS hash, b.data IS NULL AS in_file FROM blobs b
 WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.blob_id = b.id)
   AND NOT EXISTS (SELECT 1 FROM trash t WHERE t.blob_id = b.id)
 """
@@ -181,6 +184,10 @@ def translate_sqlite_error(exc: sqlite3.Error, what: str) -> MyBucketError:
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool, timeout: float) -> None:
+    # A database received from elsewhere is untrusted: SQL stored in its schema
+    # may not call functions with side effects (check_schema refuses triggers
+    # and views altogether).
+    conn.execute("PRAGMA trusted_schema = OFF")
     conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
     conn.execute("PRAGMA foreign_keys = ON")
     if readonly:
@@ -255,12 +262,87 @@ def check_db(conn: sqlite3.Connection) -> dict:
         meta = dict(conn.execute("SELECT k, v FROM meta").fetchall())
     except sqlite3.Error as exc:
         raise translate_sqlite_error(exc, "read the bucket database") from exc
-    fmt = int(meta.get("format", 0))
+    try:
+        fmt = int(meta.get("format", 0))
+    except (TypeError, ValueError, OverflowError):
+        fmt = 0
     if fmt > FORMAT_VERSION:
         raise UnsupportedFormat(f"This bucket uses format {fmt}; this mybucket reads up to format {FORMAT_VERSION}.")
     if fmt < 1:
         raise StoreError("The bucket database has no format version.", hint="Restore it from a snapshot or backup.")
+    check_schema(conn, fmt)
     return meta
+
+
+def _normalise_sql(sql: str) -> str:
+    sql = re.sub(r"\s+", " ", sql).strip()
+    return sql.replace(" IF NOT EXISTS ", " ")
+
+
+def _expected_schema() -> dict[str, tuple[str, str, bool]]:
+    """name -> (type, normalised sql, format 2 only) for everything mybucket creates."""
+    out: dict[str, tuple[str, str, bool]] = {}
+    for text, v2 in ((SCHEMA_SQL, False), (SCHEMA_V2_SQL, True)):
+        for statement in text.split(";"):
+            sql = _normalise_sql(statement)
+            if not sql:
+                continue
+            m = re.match(r"CREATE (TABLE|INDEX) (\w+)", sql)
+            assert m, sql
+            out[m.group(2)] = (m.group(1).lower(), sql, v2)
+    return out
+
+
+_EXPECTED = _expected_schema()
+_SQLITE_INTERNAL = {"sqlite_sequence", "sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
+
+
+def check_schema(conn: sqlite3.Connection, fmt: int) -> None:
+    """Refuse (UnsafeStore) a bucket database whose schema mybucket did not write.
+
+    Every table and index mybucket defines must have exactly its definition
+    (whitespace aside); triggers, views and virtual tables are never
+    accepted. Other plain tables are allowed only when their names start
+    with ``x_`` (room for extensions that older readers safely ignore).
+    """
+    try:
+        rows = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
+    except sqlite3.Error as exc:
+        raise translate_sqlite_error(exc, "read the bucket database") from exc
+    seen = set()
+    for kind, name, table, sql in rows:
+        problem = None
+        text = _normalise_sql(sql) if isinstance(sql, str) else None
+        if kind in ("trigger", "view"):
+            problem = f"it contains a {kind} ({name!r})"
+        elif text is not None and text.upper().startswith("CREATE VIRTUAL"):
+            problem = f"it contains a virtual table ({name!r})"
+        elif name in _EXPECTED:
+            want_kind, want_sql, _v2 = _EXPECTED[name]
+            if kind != want_kind or text != want_sql:
+                problem = f"its {name!r} {want_kind} is not defined the way mybucket defines it"
+            seen.add(name)
+        elif kind == "index" and text is None and isinstance(name, str) and name.startswith("sqlite_autoindex_"):
+            pass  # made by SQLite for a UNIQUE or PRIMARY KEY constraint
+        elif kind == "table" and name in _SQLITE_INTERNAL:
+            pass
+        elif isinstance(table, str) and table.startswith("x_") and kind in ("table", "index"):
+            pass
+        else:
+            problem = f"it contains an unexpected {kind} ({name!r})"
+        if problem:
+            raise UnsafeStore(
+                f"This bucket database was not written by mybucket, so it was not opened: {problem}.",
+                hint="If the store came from elsewhere, take the bucket from a trusted copy, or read "
+                "its data by hand as docs/FORMAT.md describes.",
+            )
+    required = [n for n, (k, _sql, v2) in _EXPECTED.items() if k == "table" and (fmt >= 2 or not v2)]
+    missing = [n for n in required if n not in seen]
+    if missing:
+        raise StoreError(
+            f"The bucket database is incomplete: the {', '.join(repr(n) for n in missing)} table is missing.",
+            hint="Restore the bucket from a snapshot or backup.",
+        )
 
 
 def has_table(conn: sqlite3.Connection, name: str) -> bool:

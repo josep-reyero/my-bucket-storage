@@ -240,7 +240,18 @@ def validate_metadata(metadata: object) -> str | None:
 
 
 def parse_metadata(text: str | None) -> dict[str, str]:
-    return {} if not text else json.loads(text)
+    """The metadata dict stored as ``text``; DamagedError when the stored value is not one."""
+    if not text:
+        return {}
+    try:
+        value = json.loads(text) if isinstance(text, (str, bytes)) else None
+    except (ValueError, RecursionError):
+        value = None
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        from .errors import DamagedError
+
+        raise DamagedError("The stored metadata of an object is damaged (it is not a JSON object of strings).")
+    return value
 
 
 def validate_content_type(value: object) -> str | None:

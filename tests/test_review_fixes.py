@@ -338,15 +338,16 @@ def test_expected_size_and_sha256(bucket):
 # -- reads: streams are verified only at the end -----------------------------------------
 
 
-def test_partial_stream_read_is_not_verified(bucket):
+def test_partial_stream_read_is_checked_before_any_byte(bucket):
+    """Audit A4: an unframed object is checked in full before the first byte is handed out."""
     data = os.urandom(600_000)
     bucket.put("big", data)
+    with bucket.open("big") as stream:
+        assert stream.read(1000) == data[:1000] and stream.verified
     flip(blob_path(bucket.path, sha(data)))
     with bucket.open("big") as stream:
-        head = stream.read(1000)
-        assert head != data[:1000] and not stream.verified
         with pytest.raises(DamagedError):
-            stream.read()
+            stream.read(1000)
     with bucket.open("big") as stream:
         with pytest.raises(DamagedError):
             stream.read()

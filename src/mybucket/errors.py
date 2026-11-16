@@ -182,6 +182,18 @@ class NotAStore(Refused):
     default_hint = "Point at an empty directory, a new path, or an existing mybucket store."
 
 
+class UnsafeStore(Refused):
+    """The store holds something mybucket refuses to use: a symbolic link inside it, a
+    database with triggers or views, or a database schema it did not write."""
+
+    code = "unsafe_store"
+    default_hint = (
+        "If this store was copied, synced or restored from elsewhere, take it from a trusted "
+        "copy. A symbolic link inside a store must be replaced by the real folder or file; "
+        "mybucket never follows links inside a store."
+    )
+
+
 # -- temporary (75) ----------------------------------------------------------
 
 
@@ -265,6 +277,8 @@ def from_os_error(exc: OSError, what: str) -> MyBucketError:
         return DiskFull(f"Could not {what}: the disk is full or the file is too large for it ({reason}). Nothing was written.")
     if exc.errno in (_errno.EACCES, _errno.EPERM) or isinstance(exc, PermissionError):
         return PermissionDenied(f"Could not {what}: permission denied ({exc.filename or reason}).")
+    if exc.__class__.__name__ == "UnsafePath":
+        return UnsafeStore(f"Could not {what}: {exc.strerror or reason}, and mybucket never follows links inside a store.")
     if isinstance(exc, FileNotFoundError):
         return StoreError(
             f"Could not {what}: a file or folder of the bucket is missing ({exc.filename or reason}).",
@@ -292,6 +306,7 @@ __all__ = [
     "BucketExists",
     "BucketNotEmpty",
     "NotAStore",
+    "UnsafeStore",
     "Busy",
     "PermissionDenied",
     "AccessDenied",

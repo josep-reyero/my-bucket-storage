@@ -90,6 +90,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -148,17 +149,6 @@ def _check_seconds(name: str, value: object) -> float:
             f"{name} must be a number of seconds >= 0, got {value!r}.", hint="Leave it out to use the default."
         )
     return float(value)
-
-
-def _remove_empty_dirs(path: Path, stop: Path) -> None:
-    """Remove ``path`` and its parents up to (not including) ``stop`` while they are empty."""
-    while path != stop and stop in path.parents:
-        try:
-            path.rmdir()
-        except OSError:
-            return
-        _blobs.fsync_dir(path.parent)
-        path = path.parent
 
 
 # -- gc ----------------------------------------------------------------------
@@ -226,7 +216,7 @@ def gc(
             except sqlite3.Error as exc:
                 raise translate_sqlite_error(exc, f"read bucket {name!r}") from exc
         try:
-            age = wall - path.stat().st_mtime
+            age = wall - os.lstat(path).st_mtime
         except FileNotFoundError:
             continue
         if age >= orphan_grace:
@@ -243,28 +233,30 @@ def gc(
             for hex_hash in sorted(candidates):
                 if _has_row(txn.conn, bytes.fromhex(hex_hash)):
                     continue  # a writer committed this content meanwhile: keep it
-                path = _blobs.blob_path(bucket.path, hex_hash)
                 try:
-                    size = path.stat().st_size
-                    if not _blobs.remove_blob_file(bucket.path, hex_hash):
-                        continue
+                    # Unlinks relative to its folder, opened without following links.
+                    size = _blobs.remove_blob_file(bucket.path, hex_hash, prune=True)
                 except FileNotFoundError:
                     continue
                 except OSError as exc:
                     failures.append(f"{_blobs.blob_relpath(hex_hash)}: {exc.strerror or exc}")
+                    continue
+                if size is None:
                     continue
                 file_bytes += size
                 if hex_hash in dropped_files:
                     files_removed += 1
                 else:
                     orphans_removed += 1
-                _remove_empty_dirs(path.parent, bucket.blobs_dir)
 
     # 4. Abandoned temp files (never one a live writer holds).
     tmp_removed = tmp_bytes = 0
     bucket._check_alive()  # never clean the tmp/ of a bucket that replaced ours
     for path in _blobs.iter_tmp_files(bucket.path):
-        if not path.is_file():
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+        except FileNotFoundError:
             continue
         try:
             size = _blobs.remove_stale_tmp(path, min_age=tmp_min_age)  # unlinks holding the flock
@@ -348,20 +340,25 @@ def gc_store(
     ]
     leftovers = 0
     root = store.buckets_dir
-    if root.is_dir():
-        wall = time.time()
-        for entry in root.iterdir():
-            if not entry.is_dir() or not entry.name.startswith((".creating-", ".deleting-")):
+    try:
+        with os.scandir(root) as it:
+            # A link is never a leftover of ours, and rmtree must never follow one.
+            entries = [root / e.name for e in it if e.is_dir(follow_symlinks=False)]
+    except (FileNotFoundError, NotADirectoryError):
+        entries = []
+    wall = time.time()
+    for entry in entries:
+        if not entry.name.startswith((".creating-", ".deleting-")):
+            continue
+        try:
+            # A .creating- directory may belong to a create_bucket() in progress.
+            if entry.name.startswith(".creating-") and wall - os.lstat(entry).st_mtime < LEFTOVER_DIR_MIN_AGE:
                 continue
-            try:
-                # A .creating- directory may belong to a create_bucket() in progress.
-                if entry.name.startswith(".creating-") and wall - entry.stat().st_mtime < LEFTOVER_DIR_MIN_AGE:
-                    continue
-            except FileNotFoundError:
-                continue
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                leftovers += 1
+        except FileNotFoundError:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not os.path.lexists(entry):
+            leftovers += 1
     freed = sum(r["bytes_freed"] for r in results)
     summary = f"Cleaned {_plural(len(results), 'bucket')}" + (
         f"; freed about {_human_bytes(freed)}." if freed else "; nothing needed freeing."
@@ -585,32 +582,52 @@ WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.dict_id = d.id)
 
 
 def _scan_blob_dir(bucket: Bucket) -> tuple[list[dict], list[str]]:
-    """Files under blobs/ with no row (orphans) and entries that are not blob files at all."""
+    """Files under blobs/ with no row (orphans) and entries that are not blob files at all.
+
+    Links are never followed: a link (to a file or a folder) is reported as
+    unexpected, and a linked folder is not entered.
+    """
     orphans: list[dict] = []
     unexpected: list[str] = []
     root = bucket.blobs_dir
-    if not root.is_dir():
-        return orphans, unexpected
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
-        for filename in sorted(filenames):
-            path = Path(dirpath) / filename
-            rel = path.relative_to(bucket.path).as_posix()
-            if not _blobs.HEX_RE.fullmatch(filename) or rel != _blobs.blob_relpath(filename):
-                unexpected.append(rel)
-                continue
-            with bucket._locked_conn() as conn:
-                found = conn.execute(
-                    "SELECT data IS NULL FROM blobs WHERE hash = ?", (bytes.fromhex(filename),)
-                ).fetchone()
-            if found is None:
-                try:
-                    size = path.stat().st_size
-                except FileNotFoundError:
-                    continue  # removed by gc meanwhile
-                orphans.append({"etag": filename, "path": rel, "bytes": size})
-            elif not found[0]:
-                unexpected.append(rel)  # content is stored inline; this file is an extra copy
+
+    def walk(path: Path, rel: str, depth: int):
+        try:
+            with os.scandir(path) as it:
+                entries = sorted(((e.name, e.is_symlink(), e.is_dir(follow_symlinks=False)) for e in it))
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        for name, is_link, is_dir in entries:
+            sub = f"{rel}/{name}"
+            if is_link:
+                unexpected.append(sub)
+            elif is_dir:
+                if depth < 2:
+                    walk(path / name, sub, depth + 1)
+                else:
+                    unexpected.append(sub + "/")
+            else:
+                yield_file(path / name, name, sub)
+
+    def yield_file(path: Path, filename: str, rel: str) -> None:
+        if not _blobs.HEX_RE.fullmatch(filename) or rel != _blobs.blob_relpath(filename):
+            unexpected.append(rel)
+            return
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return  # removed by gc meanwhile
+        if not stat.S_ISREG(st.st_mode):
+            unexpected.append(rel)
+            return
+        with bucket._locked_conn() as conn:
+            found = conn.execute("SELECT data IS NULL FROM blobs WHERE hash = ?", (bytes.fromhex(filename),)).fetchone()
+        if found is None:
+            orphans.append({"etag": filename, "path": rel, "bytes": st.st_size})
+        elif not found[0]:
+            unexpected.append(rel)  # content is stored inline; this file is an extra copy
+
+    walk(root, _blobs.BLOBS_DIR, 0)
     return orphans, unexpected
 
 
@@ -747,9 +764,9 @@ def _snapshot_bucket(bucket: Bucket, bdir: Path) -> dict:
             missing = []
             for hex_hash in sorted(wanted - present):
                 try:
-                    linker.place(_blobs.blob_path(bucket.path, hex_hash), bdir, hex_hash)
-                except FileNotFoundError:
-                    missing.append(hex_hash)
+                    linker.place(bucket.path, bdir, hex_hash)
+                except (FileNotFoundError, _blobs.UnsafePath):
+                    missing.append(hex_hash)  # a link or special file is never put in a snapshot
                     continue
                 present.add(hex_hash)
         if not missing:
@@ -817,50 +834,71 @@ class _Linker:
         self.bytes_copied = 0
         self._dirs: set[Path] = set()
 
-    def place(self, src: Path, bdir: Path, hex_hash: str) -> None:
+    def place(self, bucket_dir: Path, bdir: Path, hex_hash: str) -> None:
+        """Link (or copy) the blob file of ``hex_hash`` into the snapshot ``bdir``.
+
+        The source is reached without following links and must be a regular
+        file: anything else raises UnsafePath and is never linked or copied.
+        """
         dst = bdir / _blobs.blob_relpath(hex_hash)
         for directory in (dst.parent.parent, dst.parent):
             if not directory.is_dir():
                 directory.mkdir(mode=0o700, exist_ok=True)
                 self._dirs.add(directory.parent)
         self._dirs.add(dst.parent)
-        if self.can_link:
-            try:
-                os.link(src, dst)
-                self.linked += 1
-                return
-            except FileNotFoundError:
-                raise
-            except OSError:
-                self.can_link = False  # another filesystem or not permitted: copy from now on
-        self.bytes_copied += _copy_file(src, dst)
-        self.copied += 1
+        fd = _blobs.open_blob(bucket_dir, hex_hash)  # FileNotFoundError, UnsafePath
+        try:
+            if self.can_link:
+                src = _blobs.blob_path(bucket_dir, hex_hash)
+                try:
+                    st = os.lstat(src)
+                    if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != _identity(os.fstat(fd)):
+                        raise _blobs.UnsafePath(0, "the blob file changed while it was being linked", hex_hash)
+                    os.link(src, dst, follow_symlinks=False)
+                    self.linked += 1
+                    return
+                except FileNotFoundError:
+                    raise
+                except _blobs.UnsafePath:
+                    raise
+                except OSError:
+                    self.can_link = False  # another filesystem or not permitted: copy from now on
+            self.bytes_copied += _copy_fd(fd, dst)
+            self.copied += 1
+        finally:
+            os.close(fd)
 
     def sync(self) -> None:
         for directory in sorted(self._dirs, key=lambda p: len(p.parts), reverse=True):
             _blobs.fsync_dir(directory)
 
 
-def _copy_file(src: Path, dst: Path) -> int:
-    with open(src, "rb") as fin:  # once open, gc unlinking the name does not matter
-        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        size = 0
-        try:
-            while True:
-                chunk = fin.read(CHUNK)
-                if not chunk:
-                    break
-                view = memoryview(chunk)
-                while view:
-                    n = os.write(fd, view)
-                    view = view[n:]
-                size += len(chunk)
-            _blobs.fsync_file(fd)
-        except BaseException:
-            os.close(fd)
-            dst.unlink(missing_ok=True)
-            raise
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
+
+
+def _copy_fd(src_fd: int, dst: Path) -> int:
+    """Copy the open (already checked) source file to the new file ``dst``."""
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    size = 0
+    try:
+        offset = 0
+        while True:
+            chunk = os.pread(src_fd, CHUNK, offset)
+            if not chunk:
+                break
+            offset += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            size += len(chunk)
+        _blobs.fsync_file(fd)
+    except BaseException:
         os.close(fd)
+        dst.unlink(missing_ok=True)
+        raise
+    os.close(fd)
     return size
 
 
@@ -882,7 +920,7 @@ def restore(bucket: Bucket, key: str, version: int) -> PutInfo:
     """
     bucket._require_writable()
     key = _keys.validate_key(key)
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+    if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= (1 << 63) - 1:
         raise InvalidArgument(
             f"version must be a positive whole number, got {version!r}.",
             hint="List the versions of the key to see their numbers.",

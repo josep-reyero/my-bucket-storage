@@ -34,6 +34,11 @@ A conversation is strictly request / response, one at a time:
 
 The first request must be ``hello`` with ``"protocol": 1``.
 
+A ``list`` answer says ``"complete": true`` when it reached the end of the
+keys asked for; a client treats a listing without it as possibly cut short
+(``sync --delete`` then deletes nothing), and a ``"truncated": true`` page
+without a ``next_start_after`` that moves forward as a protocol error.
+
 Internal for siblings:
     PROTOCOL_VERSION, KIND_JSON, KIND_DATA, MAX_DATA, MAX_REQUEST_JSON, MAX_RESPONSE_JSON
     Channel(rfile, wfile, max_json, max_data)   .send_json(obj), .send_data(b), .flush(),

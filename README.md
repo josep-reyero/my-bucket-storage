@@ -37,9 +37,8 @@ gives them one small, tested primitive instead:
 - re-putting identical content is cheap and reports `unchanged`;
 - overwritten and deleted objects stay in a trash for 7 days (configurable);
 - crash safety: a crash at any moment never loses a committed object and
-  never leaves a readable-but-corrupt one. `get()` checks the size and
-  SHA-256 of everything it returns; a stream from `open()` is checked when it
-  reaches the end (see [Reading](#reading)).
+  never leaves a readable-but-corrupt one. Every byte `get()` and `open()`
+  hand out has been checked against its SHA-256 (see [Reading](#reading)).
 
 ## Install
 
@@ -79,7 +78,7 @@ notes.exists("2026/11/14/day.json")            # -> True
 with open("video.mp4", "rb") as f:
     notes.put("media/video.mp4", f, content_type="video/mp4")
 with notes.open("media/video.mp4") as stream:
-    first_mb = stream.read(1 << 20)            # not verified yet: see "Reading"
+    first_mb = stream.read(1 << 20)            # checked before it is handed out
 
 # S3-style listing with common prefixes and pagination.
 page = notes.list(prefix="2026/", delimiter="/", limit=100)
@@ -166,20 +165,26 @@ look like `type/subtype`.
 ### Reading
 
 - `get(key)` returns the whole object and has checked its size and SHA-256:
-  damaged data raises DamagedError instead of being returned.
-- `open(key)` returns a stream. It is checked as it is read, but the check
-  can only conclude at the end: reading to the end of damaged content raises
-  DamagedError. **Bytes from a partial read (`stream.read(1000)`) of an
-  object up to 4 MiB are not verified yet.** `stream.verified` becomes True
-  once the end was reached and everything matched.
+  damaged data raises DamagedError instead of being returned. Because it
+  holds the result in memory, `get()` refuses (Refused, exit 5) to return
+  more than 1 GiB; stream larger objects with `open()`, or pass
+  `get(key, max_size=None)` (or another limit in bytes).
+- `open(key)` returns a stream, and every byte it hands out has been checked
+  first, even from a partial read (`stream.read(1000)`). An object of up to
+  4 MiB is checked in full (in memory) before its first byte is handed out,
+  so a stream of it may use up to 4 MiB; a larger one is checked frame by
+  frame as it is read. `stream.verified` is True once the whole object has
+  been checked (for objects up to 4 MiB, as soon as reading starts).
+- A blob file is never read through a symbolic link, and must be a regular
+  file of exactly its recorded stored size before anything is read from it.
 - `get(key, start, end)` and `open(key, start, end)` read a byte range,
   with Python slice rules (`end` exclusive, both clamped to the size;
   `mybucket cat/get --start N --end M`). Objects over 4 MiB are stored in
   independent 1 MiB zstd frames, each with its own SHA-256, so a range read
-  decompresses and checks only the frames it touches, and a stream of such
-  an object never hands out a byte before its frame was checked. A range of
-  a smaller object (or of a large object written by `mybucket` 0.1) reads and
-  checks the whole object.
+  decompresses and checks only the frames it touches. A range of a smaller
+  object reads and checks the whole object. A large object written by
+  `mybucket` 0.1 has no frames, so a stream or range of it reads the object
+  twice: once to check it, once to hand it out (`get()` reads it once).
 
 ### Repairing damage
 
@@ -276,11 +281,21 @@ the bucket or key exists or not. A prefix-scoped connection lists with
 `list(prefix=...)` inside its prefix, cannot see `stats` of the whole
 bucket, and prefixes are compared on the NFC key that is actually stored.
 Use `photos/public/` (with the `/`) for a folder: `photos/public` would also
-cover `public-old/...`. Limits a prefix scope does not hide: version
-numbers count every write in the bucket, and a client that may write under
-a prefix can tell (from timing and `stored_size`) whether exact content it
-already has is stored elsewhere in the same bucket, because content is
-stored once per bucket. Use separate buckets when that matters.
+cover `public-old/...`. A bucket the profile may only read is opened
+read-only, even when the profile may write elsewhere (so it is never
+upgraded from format 1).
+
+A connection whose grants on a bucket are all prefix-scoped never sees
+`stored_size` (it is `None` in put results, `head`, `list` and stream
+info), and its writes are compressed without the bucket's trained
+dictionary. A dictionary is trained on the whole bucket, so compressed
+sizes could otherwise tell a client something about content stored under
+other prefixes. Limits a prefix scope still does not hide: version numbers
+count every write in the bucket, and a client that may write under a prefix
+can tell from timing whether exact content it already has is stored
+elsewhere in the same bucket, because content is stored once per bucket.
+**When clients must not learn anything about each other's data, give them
+separate buckets.**
 
 The server treats the client as hostile: frames are size-limited (64 KiB
 requests, 1 MiB data chunks), every field is type-checked, every bucket name
@@ -310,9 +325,21 @@ damaged source object is reported and never copied. Small objects are
 committed in batches, large ones streamed. An interrupted sync (Ctrl-C,
 kill -9, lost connection) leaves only complete, verified objects behind;
 run it again to finish. By default nothing is deleted in the destination;
-`--delete` moves objects missing from the source to the destination's trash.
+`--delete` moves objects missing from the source to the destination's trash,
+with two safety rules:
+
+- nothing is deleted until the whole source listing has been read and the
+  source confirmed it was complete. A listing that stops early, comes out of
+  order, or comes from an older remote `mybucket` that does not confirm
+  completion deletes nothing;
+- at most half of the destination bucket's objects (under `--prefix`, but
+  at least 10) are deleted per bucket. Above that nothing is deleted in that
+  bucket and sync exits 5; `--max-delete N` sets another limit and `--force`
+  removes it (`sync(..., max_delete=N, force=True)` in Python).
+
 Trash and old versions are not copied. `mybucket sync` exits 1 when
-anything was not copied.
+anything was not copied, and 5 when deletes were refused (everything else
+was still synced).
 
 ## Maintenance, backups and export
 
@@ -372,6 +399,10 @@ coexist as files: a key that is also a folder of other keys, and keys that
 differ only in letter case on a case-insensitive disk (`--skip-conflicts`
 exports the rest).
 
+Keys may start with `-` (`-notes.txt`); export writes them as ordinary
+files, which is fine, but remember `--` (`rm -- -notes.txt`) when you handle
+such files with other command-line tools.
+
 Keys that differ only in letter case (`Photo.jpg` and `photo.jpg`, `É` and
 `é`) count as a clash on a case-insensitive disk such as the macOS default;
 even if that check were wrong, export never writes two keys into one file.
@@ -415,7 +446,12 @@ one.
 - `--json` (before or after the command) makes stdout carry exactly one JSON
   document. Errors are then `{"error": {"code", "message", "hint"}}` on
   stdout; without `--json` they go to stderr as plain text.
-- `get` and `export` refuse destinations inside the store.
+- `get` and `export` refuse destinations inside the store. Files `get`
+  creates are readable by you only (mode 0600), like everything export writes.
+- Human-readable output shows control characters and invisible characters
+  in keys, content types and metadata escaped (`\x1b`, `\u202e`), so a store
+  from elsewhere cannot change what your terminal shows. `--json` output
+  escapes them too.
 
 ### Exit codes
 
@@ -426,7 +462,7 @@ one.
 | 2 | usage: invalid key, bucket name or argument |
 | 3 | not found: store, bucket, object, version, folder |
 | 4 | not allowed: read-only store, access profile, permission denied |
-| 5 | refused for safety: failed `--if-match` / `--if-none-match`, `--expect-*` mismatch, bucket not empty, export conflict |
+| 5 | refused for safety: failed `--if-match` / `--if-none-match`, `--expect-*` mismatch, bucket not empty, export conflict, `get` over its size limit, `sync --delete` over its limit, a store that is unsafe to open (symbolic links inside it, a database `mybucket` did not write) |
 | 75 | temporary: another process holds the write lock; retry |
 
 ## How it stores data
@@ -445,6 +481,26 @@ one.
 - If another process deletes a bucket, handles that are still open on it
   refuse further reads and writes (BucketNotFound) instead of writing into a
   deleted file.
+
+### A store from elsewhere
+
+A store you received (a snapshot, a synced copy, a restored backup) may have
+been altered, and `mybucket` treats it that way:
+
+- it never follows a symbolic link inside a store. A bucket whose folder,
+  database files, `blobs/`, `tmp/` or fan-out folders are links is refused
+  (UnsafeStore, exit 5); a blob file that is a link is reported as damaged
+  and is never read, linked into a snapshot or copied; gc, verify, snapshot
+  and bucket deletion never enter a linked folder or delete through one.
+  Only the store directory itself may be a link (you named it);
+- it opens SQLite with `trusted_schema=OFF` and refuses a database with
+  triggers, views, virtual tables, or tables and indexes defined differently
+  from what `mybucket` writes (UnsafeStore);
+- values of the wrong type in the database (text where a hash or a number
+  belongs, an unusable dictionary, a version counter at its limit) give a
+  plain DamagedError or StoreError, not an internal error;
+- the recovery script of [docs/FORMAT.md](docs/FORMAT.md#52-recovering-a-whole-bucket)
+  reads the database as data only and skips anything unsafe.
 
 Details, including how to read everything back by hand: [docs/FORMAT.md](docs/FORMAT.md).
 

@@ -764,8 +764,9 @@ def test_damaged_and_missing_blob_files(bucket):
     path.write_bytes(original[:-10])
     with pytest.raises(DamagedError):
         bucket.get("k")
-    with bucket.open("k") as f, pytest.raises(DamagedError):
-        f.read()
+    with pytest.raises(DamagedError):  # a blob file of the wrong size is refused before any byte is read
+        with bucket.open("k") as f:
+            f.read()
     path.write_bytes(original + b"extra")
     with pytest.raises(DamagedError):
         bucket.get("k")

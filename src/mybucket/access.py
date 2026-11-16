@@ -40,6 +40,7 @@ Public:
                                           .require_bucket(name) .require_key(name, key, write)
                                           .require_list(name, prefix) .require_whole_bucket(name)
                                           .require_create() .visible(name) .writable(name)
+                                          .whole_bucket(name)
 """
 
 from __future__ import annotations
@@ -128,6 +129,10 @@ class Profile:
 
     def writable(self, name: str) -> bool:
         return any(g.write for g in self._for(name))
+
+    def whole_bucket(self, name: str) -> bool:
+        """True when some grant covers all of bucket ``name`` (not only a prefix of it)."""
+        return any(g.prefix == "" for g in self._for(name))
 
     def _deny(self, what: str) -> AccessDenied:
         return AccessDenied(f"This connection may not {what}.")

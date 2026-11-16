@@ -26,15 +26,22 @@ uncompressed content and produces a ``Staged`` blob:
   installs under ``blobs/`` while holding the write lock.
 
 Read side: ``BlobReader`` streams the uncompressed content (or a range of it)
-of one blob row, never producing more than the recorded size. A blob with a
-frame table is checked frame by frame: every frame is verified against its
-SHA-256 before any of its bytes are handed out, so even partial and range
-reads only return checked bytes. A blob without one (small objects, and
-large objects written by mybucket 0.1) is checked against its size and
-SHA-256 when the end is reached: bytes handed out *before* the end are not
-yet verified (``BlobReader.verified`` turns True once they are), and a range
-read of such a blob reads on to the end to finish the check. Any mismatch
-raises DamagedError, so damaged data is never returned silently by ``get()``.
+of one blob row, never producing more than the recorded size. A blob file is
+opened without following links and must be a regular file of exactly the
+recorded stored size before anything is read. Every byte handed out has
+been checked:
+
+- a blob with a frame table is checked frame by frame: each frame is
+  verified against its SHA-256 before any of its bytes are handed out;
+- a blob without one (small objects, and large objects written by mybucket
+  0.1) has a single SHA-256 for the whole content, so it is checked in full
+  *before* the first byte is handed out: content of up to ``SMALL_MAX``
+  (4 MiB) is decompressed once into memory, checked and then served from
+  there; larger content (only mybucket 0.1 wrote such blobs) is read twice,
+  once to check it and once to stream it (``verify_first=False``, used by
+  ``get()``, which returns nothing before the end anyway, reads it once).
+
+Any mismatch raises DamagedError.
 
 Internal for siblings:
     INLINE_MAX, SMALL_MAX, LEVEL_SMALL, LEVEL_LARGE, CHUNK, FRAME_SIZE, DICT_MAX
@@ -50,10 +57,12 @@ Internal for siblings:
             .stored_size, .dict_id, .frames, .inline (bytes | None),
             .tmp (TempFile | None), .discard(), .drop_dictionary(),
             .stored_bytes_file() -> TempFile (the stored bytes in a temp file)
-    BlobReader(bucket_dir, row, label="", frames=None, dictionary=None, start=0, end=None)
+    BlobReader(bucket_dir, row, label="", frames=None, dictionary=None, start=0, end=None,
+               verify_first=True)
                                      io.RawIOBase; raises FileNotFoundError at
-                                     construction when a file blob is missing;
-                                     .verified
+                                     construction when a file blob is missing,
+                                     DamagedError when it is a link, not a regular
+                                     file or not the recorded size; .verified
     check_blob(bucket_dir, row, frames=None, dictionary=None) -> str | None
                                      problem description, None if intact
 """
@@ -70,7 +79,7 @@ from typing import NamedTuple
 import struct
 
 from . import _zstd
-from .blobs import TempFile, blob_path
+from .blobs import TempFile, UnsafePath, open_blob
 from .errors import DamagedError, InvalidArgument, UnsupportedFormat
 
 INLINE_MAX = 128 * 1024
@@ -97,7 +106,8 @@ CODEC_ZSTD = 1
 CODEC_FRAMES = 2
 CODEC_NAMES = {CODEC_RAW: "raw", CODEC_ZSTD: "zstd", CODEC_FRAMES: "zstd frames"}
 
-BLOB_COLUMNS = "id, hash, size, stored_size, codec, dict_id, data"
+#: CAST: a database from elsewhere may hold TEXT there; it must read as damage, not fail to decode.
+BLOB_COLUMNS = "id, CAST(hash AS BLOB), size, stored_size, codec, dict_id, CAST(data AS BLOB)"
 FRAME_COLUMNS = "start, size, stored_start, stored_size, hash"
 
 #: zstd seekable format (contrib/seekable_format in the zstd sources).
@@ -478,6 +488,23 @@ def _decompress_frame(data: bytes, size: int, dictionary: _zstd.Dictionary | Non
     return out
 
 
+def _checked_row(row: BlobRow) -> BlobRow:
+    """``row`` with the types a reader relies on, or DamagedError (a database from elsewhere may hold anything)."""
+    ints = (row.id, row.size, row.stored_size, row.codec)
+    ok = (
+        all(isinstance(v, int) and not isinstance(v, bool) for v in ints)
+        and row.size >= 0
+        and row.stored_size >= 0
+        and (row.dict_id is None or (isinstance(row.dict_id, int) and not isinstance(row.dict_id, bool)))
+        and isinstance(row.hash, bytes)
+        and len(row.hash) == 32
+        and (row.data is None or isinstance(row.data, bytes))
+    )
+    if not ok:
+        raise DamagedError(f"Stored content {row.id!r} is damaged: its database row holds values of the wrong type.")
+    return row
+
+
 class BlobReader(io.RawIOBase):
     """Readable stream of one blob's uncompressed bytes (or of ``[start, end)``), always checked.
 
@@ -495,10 +522,11 @@ class BlobReader(io.RawIOBase):
         dictionary: LoadedDict | None = None,
         start: int = 0,
         end: int | None = None,
+        verify_first: bool = True,
     ) -> None:
         super().__init__()
         self._fp = None
-        self._row = row
+        self._row = row = _checked_row(row)
         self._label = label or row.hash.hex()
         self.verified = False
         self._start = max(0, min(start, row.size))
@@ -516,9 +544,22 @@ class BlobReader(io.RawIOBase):
         if row.codec == CODEC_FRAMES or frames:
             self._frames = self._check_frames(frames or [])
         if row.data is not None:
+            if len(row.data) != row.stored_size:
+                raise self._damaged(f"its stored size is {len(row.data)} bytes, the row records {row.stored_size}")
             self._fp = io.BytesIO(row.data)
         else:
-            self._fp = open(blob_path(bucket_dir, row.hash.hex()), "rb")  # noqa: SIM115
+            try:
+                fd = open_blob(bucket_dir, row.hash.hex())
+            except UnsafePath:
+                raise self._damaged("its blob file is a symbolic link or not a regular file, which mybucket never reads") from None
+            try:
+                actual = os.fstat(fd).st_size
+                if actual != row.stored_size:
+                    raise self._damaged(f"its blob file is {actual} bytes, the row records {row.stored_size}")
+            except BaseException:
+                os.close(fd)
+                raise
+            self._fp = os.fdopen(fd, "rb")
         self._pending = memoryview(b"")
         self._hasher = hashlib.sha256()
         self._count = 0  # content bytes read from the blob so far (unframed only)
@@ -531,6 +572,9 @@ class BlobReader(io.RawIOBase):
         else:
             self._z = _zstd.FrameReader(self._fp, READ_CHUNK, CHUNK, self._zdict) if row.codec == CODEC_ZSTD else None
             self._skip = self._start  # unframed: bytes before the range are read and hashed, not handed out
+        #: Unframed content is checked in full before the first byte is handed out.
+        self._verify_first = verify_first and self._frames is None and not self._done
+        self._prechecked = False
 
     @property
     def whole(self) -> bool:
@@ -629,8 +673,16 @@ class BlobReader(io.RawIOBase):
             if not chunk:
                 self._finish()
             return chunk
+        if self._verify_first and not self._prechecked:
+            data = self._precheck()
+            if data is not None:
+                self._done = True
+                return data
         while True:
             if self._count >= self._end:
+                if self._prechecked:
+                    self._done = True  # already checked in full: no need to read on
+                    return b""
                 # The range is complete: read on to the end of the blob so it can be checked.
                 while not self._done:
                     rest = self._next_unframed(CHUNK)
@@ -649,6 +701,32 @@ class BlobReader(io.RawIOBase):
             hi = min(self._end, self._count) - before
             if hi > lo:
                 return chunk[lo:hi]
+
+    def _precheck(self) -> bytes | None:
+        """Read and check the whole unframed blob before anything is handed out.
+
+        Small content is kept and the range of it returned; larger content is
+        only checked, then the blob is read again from the start (returns None).
+        """
+        keep: list[bytes] | None = [] if self._row.size <= SMALL_MAX else None
+        while not self._done:
+            chunk = self._next_unframed(CHUNK)
+            if not chunk:
+                self._finish()  # raises DamagedError on any mismatch
+                break
+            self._account(chunk)
+            if keep is not None:
+                keep.append(chunk)
+        self._prechecked = True
+        if keep is not None:
+            return b"".join(keep)[self._start : self._end]
+        # Second pass over the same open file (blob files are never changed in place).
+        self._fp.seek(0)
+        self._z = _zstd.FrameReader(self._fp, READ_CHUNK, CHUNK, self._zdict) if self._row.codec == CODEC_ZSTD else None
+        self._count = 0
+        self._hasher = hashlib.sha256()
+        self._done = False
+        return None
 
     def _account(self, chunk: bytes) -> None:
         self._count += len(chunk)
@@ -712,18 +790,14 @@ def check_blob(
     dictionary: LoadedDict | None = None,
 ) -> str | None:
     """Re-read and re-hash one blob. Returns a plain description of the problem, or None."""
+    try:
+        row = _checked_row(row)
+    except DamagedError as exc:
+        return exc.message
     if row.data is not None and len(row.data) != row.stored_size:
         return f"stored size is {len(row.data)} bytes, the row records {row.stored_size}"
-    if row.data is None:
-        path = blob_path(bucket_dir, row.hash.hex())
-        try:
-            actual = path.stat().st_size
-        except FileNotFoundError:
-            return "its blob file is missing"
-        if actual != row.stored_size:
-            return f"its blob file is {actual} bytes, the row records {row.stored_size}"
     try:
-        with BlobReader(bucket_dir, row, frames=frames, dictionary=dictionary) as reader:
+        with BlobReader(bucket_dir, row, frames=frames, dictionary=dictionary, verify_first=False) as reader:
             while reader.read(CHUNK):
                 pass
             if row.codec == CODEC_FRAMES and reader._frames:

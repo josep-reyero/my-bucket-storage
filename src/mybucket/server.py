@@ -20,7 +20,13 @@ the client sends is treated as hostile:
   client at the end, match what arrived; an aborted or cut-off upload leaves
   nothing behind (only a temp file that gc removes);
 - a read-only profile opens the store read-only, so SQLite itself refuses
-  writes too;
+  writes too, and a bucket the profile may only read is opened read-only
+  even when the profile may write elsewhere (so it is never upgraded);
+- a connection that only has prefix grants on a bucket compresses its
+  writes without the bucket's trained dictionary and is never told
+  ``stored_size`` (it is None in every result): a dictionary is trained on
+  the whole bucket, so compressed sizes could reveal content outside the
+  prefix;
 - error messages are the engine's plain ones with the store's location
   replaced by "<store>"; unexpected errors are reported without details.
 
@@ -175,7 +181,22 @@ class Session:
         self.profile.require_bucket(name)
         if write and not self.profile.writable(name):
             raise AccessDenied(f"This connection may not change bucket {name!r}.")
-        return self.store.bucket(name)
+        return self.open_bucket(name)
+
+    def open_bucket(self, name: str):
+        """The bucket, read-only unless this profile may write to it, and without its
+        dictionary for a prefix-scoped profile."""
+        bucket = self.store.bucket(name, readonly=not self.profile.writable(name))
+        if not self.profile.whole_bucket(name):
+            bucket.use_dictionary = False
+        return bucket
+
+    def info(self, bucket_name: str, data: dict | None) -> dict | None:
+        """An ObjectInfo / PutInfo dict as this connection may see it."""
+        if data is not None and not self.profile.whole_bucket(bucket_name):
+            data = dict(data)
+            data["stored_size"] = None
+        return data
 
     def key(self, msg: dict, bucket, write: bool) -> str:
         key = _keys.validate_key(_field(msg, "key", str, required=True))
@@ -277,12 +298,9 @@ class Session:
         except Exception as exc:  # a bug: say so without details, keep serving the framing
             if upload is not None:
                 upload.drain()
-            if os.environ.get("MYBUCKET_DEBUG"):
-                import traceback
-
-                traceback.print_exc()
-            else:
-                print(f"mybucket serve: internal error ({type(exc).__name__})", file=sys.stderr)
+            # Never a traceback here, whatever the environment says: the serving side's
+            # stderr goes back to the (untrusted) client over ssh.
+            print(f"mybucket serve: internal error ({type(exc).__name__})", file=sys.stderr)
             error = StoreError("Unexpected internal error on the server.", hint="This is a bug in mybucket.")
             error.code = "internal"
             self.reply_error(error)
@@ -326,7 +344,7 @@ def op_create_bucket(s: Session, msg: dict):
 
 def op_head(s: Session, msg: dict):
     b = s.bucket(msg)
-    return b.head(s.key(msg, b, write=False)).to_dict()
+    return s.info(b.name, b.head(s.key(msg, b, write=False)).to_dict())
 
 
 def op_exists(s: Session, msg: dict):
@@ -358,7 +376,9 @@ def op_list(s: Session, msg: dict):
         limit=min(limit, MAX_LIST),
         start_after=_field(msg, "start_after", str),
     )
-    return result.to_dict()
+    out = result.to_dict()
+    out["objects"] = [s.info(b.name, o) for o in out["objects"]]
+    return out
 
 
 def op_stats(s: Session, msg: dict):
@@ -382,7 +402,7 @@ def _put_args(s: Session, msg: dict, b) -> dict:
 def op_put(s: Session, msg: dict, upload: _Upload):
     b = s.bucket(msg, write=True)
     args = _put_args(s, msg, b)
-    return b.put(data=upload, **args).to_dict()
+    return s.info(b.name, b.put(data=upload, **args).to_dict())
 
 
 def op_delete(s: Session, msg: dict):
@@ -392,13 +412,13 @@ def op_delete(s: Session, msg: dict):
         if_match=_field(msg, "if_match", str),
         missing_ok=_field(msg, "missing_ok", bool, default=False),
     )
-    return None if info is None else info.to_dict()
+    return None if info is None else s.info(b.name, info.to_dict())
 
 
 def op_restore(s: Session, msg: dict):
     b = s.bucket(msg, write=True)
     key = s.key(msg, b, write=True)
-    return b.restore(key, _field(msg, "version", int, required=True)).to_dict()
+    return s.info(b.name, b.restore(key, _field(msg, "version", int, required=True)).to_dict())
 
 
 def op_open(s: Session, msg: dict):
@@ -413,7 +433,7 @@ def op_open(s: Session, msg: dict):
     handle = s._next_handle
     s._next_handle += 1
     s.streams[handle] = stream
-    return {"handle": handle, "info": stream.info.to_dict(), "start": stream.start, "end": stream.end}
+    return {"handle": handle, "info": s.info(b.name, stream.info.to_dict()), "start": stream.start, "end": stream.end}
 
 
 def _stream_for(s: Session, msg: dict):
@@ -474,7 +494,7 @@ def _open_batch(s: Session, msg: dict):
         raise InvalidArgument(f"The open batch is for bucket {s.batch[0]!r}, not {name!r}.")
     if s.batch[2] >= MAX_BATCH_OPS:
         raise Refused(f"A batch may hold at most {MAX_BATCH_OPS} operations.", hint="Commit it and start a new one.")
-    return s.store.bucket(name), s.batch[1]
+    return s.open_bucket(name), s.batch[1]
 
 
 def op_batch_put(s: Session, msg: dict, upload: _Upload):
@@ -500,10 +520,10 @@ def op_batch_delete(s: Session, msg: dict):
 def op_batch_commit(s: Session, msg: dict):
     if s.batch is None:
         raise InvalidArgument("No batch is open on this connection.", hint="Send batch_begin first.")
-    batch = s.batch[1]
+    name, batch = s.batch[0], s.batch[1]
     s.batch = None
     batch.__exit__(None, None, None)
-    return [None if r is None else r.to_dict() for r in batch.results or []]
+    return [None if r is None else s.info(name, r.to_dict()) for r in batch.results or []]
 
 
 def op_batch_abort(s: Session, msg: dict):

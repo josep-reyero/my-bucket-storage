@@ -16,7 +16,7 @@ lets any number of readers work alongside one writer.
 Public:
     open_store(path, readonly=False, create=True, timeout=10.0, remote_command=None) -> Store
                                           (a RemoteStore for ssh:// paths)
-    Store.bucket(name, create=False) -> Bucket
+    Store.bucket(name, create=False, readonly=False) -> Bucket
     Store.create_bucket(name, trash_days=7) -> Bucket
     Store.list_buckets() -> list[str]
     Store.delete_bucket(name, force=False)
@@ -41,6 +41,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -58,11 +59,13 @@ from .errors import (
     ReadOnlyError,
     StoreError,
     StoreNotFound,
+    UnsafeStore,
     UnsupportedFormat,
 )
 from .schema import DB_NAME, create_db, translate_sqlite_error
 
 _URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+_MARKER_MAX = 64 * 1024
 
 STORE_MARKER = "mybucket-store.json"
 BUCKETS_DIR = "buckets"
@@ -164,11 +167,26 @@ class Store:
             return
         if not root.is_dir():
             raise NotAStore(f"{root} is a file, not a store directory.")
+        # The store directory itself may be a link (the caller named it); nothing inside it may be.
+        for inside, kind in ((self.buckets_dir, "folder"), (marker, "file")):
+            try:
+                st = os.lstat(inside)
+            except FileNotFoundError:
+                continue
+            ok = stat.S_ISDIR(st.st_mode) if kind == "folder" else stat.S_ISREG(st.st_mode) and st.st_size <= _MARKER_MAX
+            if stat.S_ISLNK(st.st_mode) or not ok:
+                what = "a symbolic link" if stat.S_ISLNK(st.st_mode) else f"not a regular {kind}"
+                if kind == "file" and stat.S_ISREG(st.st_mode):
+                    what = "far too large to be a store marker"
+                raise UnsafeStore(
+                    f"The store at {root} was not opened: {inside.name} is {what}. mybucket never follows "
+                    "links inside a store."
+                )
         if marker.is_file():
             try:
                 info = json.loads(marker.read_text())
                 fmt = int(info["format"])
-            except (OSError, ValueError, KeyError, TypeError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
                 raise StoreError(
                     f"The store marker {marker.name} in {root} cannot be read ({exc}).",
                     hint=f'Its content should be {{"format": {STORE_FORMAT}}}.',
@@ -200,36 +218,47 @@ class Store:
 
     def list_buckets(self) -> list[str]:
         root = self.buckets_dir
-        if not root.is_dir():
+        try:
+            with os.scandir(root) as it:
+                names = [e.name for e in it if _keys.is_valid_bucket_name(e.name) and e.is_dir(follow_symlinks=False)]
+        except (FileNotFoundError, NotADirectoryError):
             return []
-        return sorted(
-            entry.name
-            for entry in root.iterdir()
-            if _keys.is_valid_bucket_name(entry.name) and (entry / DB_NAME).is_file()
-        )
+        out = []
+        for name in names:
+            try:
+                if stat.S_ISREG(os.lstat(root / name / DB_NAME).st_mode):
+                    out.append(name)
+            except OSError:
+                continue
+        return sorted(out)
 
-    def bucket(self, name: str, create: bool = False) -> Bucket:
-        """Open bucket ``name`` (cached per store). With ``create=True`` it is created if missing."""
+    def bucket(self, name: str, create: bool = False, readonly: bool = False) -> Bucket:
+        """Open bucket ``name`` (cached per store). With ``create=True`` it is created if missing.
+
+        ``readonly=True`` opens this one bucket read-only even on a writable
+        store (SQLite read-only too, and a format 1 bucket is not upgraded).
+        """
         path = self.bucket_dir(name)
+        want_ro = self.readonly or bool(readonly)
         with self._lock:
             cached = self._buckets.get(name)
             if cached is not None:
-                if cached._alive():
-                    return cached
-                # Closed, or deleted (and maybe re-created) by another process. A
-                # caller may still hold the old handle: it keeps refusing with
-                # BucketNotFound, and Store.close() closes it.
+                if cached._alive() and (cached.readonly == want_ro or not cached.readonly):
+                    return cached  # a writable handle serves reads too
+                # Closed, deleted (and maybe re-created) by another process, or
+                # read-only when a writable one is wanted. A caller may still hold
+                # the old handle: it keeps working or refusing, and close() closes it.
                 self._buckets.pop(name, None)
                 if cached._conn is not None:
                     self._retired.append(cached)
             if not (path / DB_NAME).is_file():
-                if not create or self.readonly:
+                if not create or want_ro:
                     raise BucketNotFound(f"Bucket {name!r} does not exist in the store at {self.path}.")
                 try:
                     return self.create_bucket(name)
                 except BucketExists:
                     pass  # created concurrently by someone else: open it
-            bucket = Bucket(self, name, path, readonly=self.readonly, timeout=self.timeout)
+            bucket = Bucket(self, name, path, readonly=want_ro, timeout=self.timeout)
             self._buckets[name] = bucket
             return bucket
 

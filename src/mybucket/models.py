@@ -31,7 +31,9 @@ class ObjectInfo:
     metadata: dict[str, str]
     modified: int  # unix ms when this version was written
     version: int  # per-bucket increasing number
-    stored_size: int  # bytes actually used for the content (shared when deduplicated)
+    #: Bytes actually used for the content (shared when deduplicated); None when
+    #: the connection may not see it (a prefix-scoped remote connection).
+    stored_size: int | None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,6 +75,9 @@ class ListResult:
     truncated: bool = False
     #: Pass as ``start_after`` to get the next page (None when not truncated).
     next_start_after: str | None = None
+    #: True when this listing reached the end of the keys asked for. A remote
+    #: listing is complete only when the server said so explicitly.
+    complete: bool = True
 
     def __iter__(self):
         """Iterate over objects and common prefixes together, in key order."""
@@ -94,6 +99,7 @@ class ListResult:
             "prefixes": list(self.prefixes),
             "truncated": self.truncated,
             "next_start_after": self.next_start_after,
+            "complete": self.complete,
         }
 
 

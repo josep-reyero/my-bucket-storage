@@ -27,10 +27,18 @@ Properties:
   conflict and left alone;
 - only current objects are copied. Trash and old versions stay on each side,
   and each side keeps its own settings (a new destination bucket gets the
-  source's ``trash_days``).
+  source's ``trash_days``);
+- **careful with deletes**: with ``delete=True`` nothing is deleted until the
+  whole source listing has been read and the source confirmed it was
+  complete (a listing that stopped early, or a remote server that does not
+  say its listing is complete, deletes nothing). Listings must come in
+  strictly increasing key order. And at most ``max_delete`` objects are
+  deleted per bucket (default: half of the destination's objects under the
+  prefix, but at least 10) unless ``force=True``; above that nothing is
+  deleted in that bucket and the report says why.
 
 Public:
-    sync(src, dst, buckets=None, prefix="", delete=False, dry_run=False) -> dict
+    sync(src, dst, buckets=None, prefix="", delete=False, dry_run=False, max_delete=None, force=False) -> dict
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from collections.abc import Iterator
 from . import keys as _keys
 from .errors import (
     BucketNotFound,
+    ProtocolError,
     ContentMismatch,
     DamagedError,
     InvalidArgument,
@@ -55,6 +64,9 @@ BATCH_BYTES = 32 * 1024 * 1024
 SMALL = 4 * 1024 * 1024
 _MAX_LISTED = 50
 _PAGE = 1000
+#: Default delete limit: this share of the destination's objects, but at least DELETE_FLOOR.
+DELETE_FRACTION = 0.5
+DELETE_FLOOR = 10
 
 #: Test hook: called with "committed" after every destination write.
 _hook = None
@@ -64,14 +76,36 @@ def _plural(n: int, word: str, many: str | None = None) -> str:
     return f"{n:,} {word if n == 1 else (many or word + 's')}"
 
 
-def _iter_objects(bucket, prefix: str) -> Iterator[ObjectInfo]:
-    start_after = None
-    while True:
-        page = bucket.list(prefix=prefix, limit=_PAGE, start_after=start_after)
-        yield from page.objects
-        if not page.truncated:
-            return
-        start_after = page.next_start_after
+class _Listing:
+    """Every current object under ``prefix``, page by page; ``complete`` once the end was confirmed."""
+
+    def __init__(self, bucket, prefix: str) -> None:
+        self.bucket = bucket
+        self.prefix = prefix
+        self.complete = False
+        self.count = 0
+
+    def __iter__(self) -> Iterator[ObjectInfo]:
+        start_after = None
+        last = None
+        while True:
+            page = self.bucket.list(prefix=self.prefix, limit=_PAGE, start_after=start_after)
+            for info in page.objects:
+                if (last is not None and info.key <= last) or not info.key.startswith(self.prefix):
+                    raise ProtocolError(
+                        f"The listing of bucket {self.bucket.name!r} is not in key order, so sync stopped "
+                        "before changing anything more.",
+                        hint="Run verify on that store; if it is remote, upgrade mybucket there.",
+                    )
+                last = info.key
+                self.count += 1
+                yield info
+            if not page.truncated:
+                self.complete = getattr(page, "complete", True) is True
+                return
+            if not isinstance(page.next_start_after, str):
+                return  # cut short without a cursor: never counts as complete
+            start_after = page.next_start_after
 
 
 def _same(a: ObjectInfo, b: ObjectInfo) -> bool:
@@ -79,13 +113,19 @@ def _same(a: ObjectInfo, b: ObjectInfo) -> bool:
 
 
 class _BucketSync:
-    def __init__(self, src, dst, name: str, prefix: str, delete: bool, dry_run: bool) -> None:
+    def __init__(
+        self, src, dst, name: str, prefix: str, delete: bool, dry_run: bool, max_delete: int | None = None, force: bool = False
+    ) -> None:
         self.src = src
         self.dst = dst
         self.name = name
         self.prefix = prefix
         self.delete = delete
         self.dry_run = dry_run
+        self.max_delete = max_delete
+        self.force = force
+        self.to_delete: list[tuple[str, str]] = []  # (key, destination etag), applied after the walk
+        self.extra_count = 0
         self.pending: list[tuple] = []  # ("put", key, data, info, dst_etag) / ("delete", key, dst_etag)
         self.pending_bytes = 0
         self.r = {
@@ -102,6 +142,7 @@ class _BucketSync:
             "damaged": [],
             "conflicts_count": 0,
             "damaged_count": 0,
+            "delete_refused": None,
         }
 
     def problem(self, kind: str, key: str, reason: str) -> None:
@@ -110,8 +151,10 @@ class _BucketSync:
             self.r[kind].append({"key": key, "reason": reason})
 
     def run(self) -> dict:
-        src_objects = _iter_objects(self.src, self.prefix)
-        dst_objects = _iter_objects(self.dst, self.prefix) if self.dst is not None else iter(())
+        src_listing = _Listing(self.src, self.prefix)
+        dst_listing = _Listing(self.dst, self.prefix) if self.dst is not None else None
+        src_objects = iter(src_listing)
+        dst_objects = iter(dst_listing) if dst_listing is not None else iter(())
         a = next(src_objects, None)
         b = next(dst_objects, None)
         while a is not None or b is not None:
@@ -129,18 +172,53 @@ class _BucketSync:
                 a = next(src_objects, None)
                 b = next(dst_objects, None)
         self.flush()
+        if self.delete and self.extra_count:
+            self.finish_deletes(src_listing, dst_listing.count if dst_listing is not None else 0)
         return self.r
+
+    def delete_limit(self, destination_objects: int) -> int | None:
+        if self.force:
+            return None
+        if self.max_delete is not None:
+            return self.max_delete
+        return max(DELETE_FLOOR, int(destination_objects * DELETE_FRACTION))
+
+    def finish_deletes(self, src_listing: _Listing, destination_objects: int) -> None:
+        """Delete the destination objects the source does not have, if that is safe."""
+        n = self.extra_count
+        if not src_listing.complete:
+            self.r["delete_refused"] = (
+                f"the listing of the source bucket did not confirm that it was complete, so the {n:,} "
+                "objects only in the destination were not deleted (an older remote mybucket does not "
+                "confirm it: upgrade it)"
+            )
+            return
+        limit = self.delete_limit(destination_objects)
+        if limit is not None and n > limit:
+            self.r["delete_refused"] = (
+                f"{n:,} of the destination's {destination_objects:,} objects would be deleted, more than "
+                f"the limit of {limit:,}, so none were deleted (pass --max-delete N or --force if that is "
+                "really intended)"
+            )
+            return
+        if self.dry_run:
+            self.r["deleted"] += n
+            return
+        for key, etag in self.to_delete:
+            self.pending.append(("delete", key, etag))
+            if len(self.pending) >= BATCH_OPS:
+                self.flush()
+        self.flush()
 
     def extra(self, info: ObjectInfo) -> None:
         if not self.delete:
             self.r["extra_in_destination"] += 1
             return
-        if self.dry_run:
-            self.r["deleted"] += 1
-            return
-        self.pending.append(("delete", info.key, info.etag))
-        if len(self.pending) >= BATCH_OPS:
-            self.flush()
+        self.extra_count += 1
+        limit = self.delete_limit(0) if self.max_delete is not None else None
+        # Remember what to delete (keys and ETags only); past an explicit limit only count.
+        if limit is None or len(self.to_delete) <= limit:
+            self.to_delete.append((info.key, info.etag))
 
     def copy(self, info: ObjectInfo, current: ObjectInfo | None) -> None:
         counter = "copied" if current is None else "updated"
@@ -155,13 +233,20 @@ class _BucketSync:
             return
         try:
             with self.src.open(info.key) as stream:
-                data = stream.read()
                 fresh = stream.info
+                if fresh.size > SMALL:
+                    data = None  # it grew since it was listed: stream it instead
+                else:
+                    data = stream.read()
         except ObjectNotFound:
             self.r["gone"] += 1
             return
         except (DamagedError, UnsupportedFormat) as exc:
             self.problem("damaged", info.key, exc.message)
+            return
+        if data is None:
+            self.flush()
+            self.copy_streamed(info.key, dst_etag, counter)
             return
         self.pending.append(("put", info.key, data, fresh, dst_etag, counter))
         self.pending_bytes += len(data)
@@ -281,7 +366,16 @@ def _same_store(src, dst) -> bool:
         return False
 
 
-def sync(src, dst, buckets: list[str] | None = None, prefix: str = "", delete: bool = False, dry_run: bool = False) -> dict:
+def sync(
+    src,
+    dst,
+    buckets: list[str] | None = None,
+    prefix: str = "",
+    delete: bool = False,
+    dry_run: bool = False,
+    max_delete: int | None = None,
+    force: bool = False,
+) -> dict:
     """Copy the current objects of ``src``'s buckets (or of ``buckets``) to ``dst``; see the module docstring.
 
     ``src`` and ``dst`` are open stores (local or remote). ``prefix`` limits
@@ -289,9 +383,16 @@ def sync(src, dst, buckets: list[str] | None = None, prefix: str = "", delete: b
     under it). ``dry_run`` reports what would change without reading or
     writing any object. Returns a report with one entry per bucket; ``ok``
     is False when an object could not be copied (damaged in the source, or
-    changed in the destination while sync ran).
+    changed in the destination while sync ran, or deletes refused).
+
+    ``max_delete`` caps how many objects ``delete`` may remove per bucket
+    (default: half of the destination's objects under the prefix, at least
+    10); ``force=True`` removes the cap. Deletes also wait until the whole
+    source listing was read and confirmed complete.
     """
     prefix = _keys.validate_prefix(prefix)
+    if max_delete is not None and (isinstance(max_delete, bool) or not isinstance(max_delete, int) or max_delete < 0):
+        raise InvalidArgument(f"max_delete must be a whole number >= 0, got {max_delete!r}.")
     if _same_store(src, dst):
         raise InvalidArgument("The source and the destination are the same store.", hint="Give two different stores.")
     if not dry_run:
@@ -308,7 +409,7 @@ def sync(src, dst, buckets: list[str] | None = None, prefix: str = "", delete: b
                 target, created = None, True
             else:
                 target, created = dst.create_bucket(name, trash_days=source.trash_days), True
-        job = _BucketSync(source, target, name, prefix, delete, dry_run)
+        job = _BucketSync(source, target, name, prefix, delete, dry_run, max_delete, force)
         report = job.run()
         report["created_bucket"] = created
         reports.append(report)
@@ -317,7 +418,8 @@ def sync(src, dst, buckets: list[str] | None = None, prefix: str = "", delete: b
         return sum(r[field] for r in reports)
 
     changed = total("copied") + total("updated")
-    problems = total("damaged_count") + total("conflicts_count")
+    refused = [r for r in reports if r["delete_refused"]]
+    problems = total("damaged_count") + total("conflicts_count") + len(refused)
     verb = "Would copy" if dry_run else "Copied"
     summary = (
         f"{verb} {_plural(changed, 'object')} ({_human(total('bytes_copied'))}) in {_plural(len(reports), 'bucket')}: "
@@ -331,14 +433,17 @@ def sync(src, dst, buckets: list[str] | None = None, prefix: str = "", delete: b
     if total("gone"):
         summary += f" {_plural(total('gone'), 'object')} disappeared from the source while sync ran."
     hint = ""
-    if problems:
+    if total("damaged_count") + total("conflicts_count"):
         summary += (
             f" {_plural(total('damaged_count'), 'object')} damaged in the source and "
             f"{_plural(total('conflicts_count'), 'object')} changed in the destination meanwhile were not copied."
         )
         hint = "Run verify on the source for damaged objects; run sync again for the others."
+    for r in refused:
+        summary += f" Bucket {r['bucket']!r}: {r['delete_refused']}."
     return {
         "ok": problems == 0,
+        "delete_refused": bool(refused),
         "dry_run": dry_run,
         "buckets": reports,
         "copied": total("copied"),

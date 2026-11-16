@@ -59,6 +59,7 @@ from .errors import (
     ReadOnlyError,
     StoreError,
 )
+from .bucket import GET_MAX, _check_get_size, _check_max_size
 from .models import BucketStats, ListResult, ObjectInfo, PutInfo, VersionInfo
 from .protocol import KIND_DATA, KIND_JSON, MAX_DATA, MAX_RESPONSE_JSON, PROTOCOL_VERSION, Channel, decode_json, error_from_wire
 
@@ -117,7 +118,7 @@ def parse_ssh_url(url: str) -> SSHTarget:
         if not _HOST_RE.fullmatch(host):
             raise _bad_url(url, f"the host name {host!r} is not allowed")
     if port is not None:
-        if not port.isdigit() or not 0 < int(port) < 65536:
+        if not re.fullmatch(r"[0-9]{1,5}", port) or not 0 < int(port) < 65536:
             raise _bad_url(url, f"the port {port!r} is not a number from 1 to 65535")
         port = int(port)
     path = path if path.startswith("~/") else "/" + path
@@ -563,8 +564,12 @@ class RemoteBucket:
         raw = _RemoteReader(self.store, result["handle"], info, result.get("start", 0), result.get("end", info.size))
         return RemoteObjectStream(raw, info)
 
-    def get(self, key: str, start: int | None = None, end: int | None = None) -> bytes:
+    def get(self, key: str, start: int | None = None, end: int | None = None, max_size: int | None = GET_MAX) -> bytes:
+        """Like Bucket.get(): refused above ``max_size`` bytes (1 GiB by default; None for no limit)."""
+        max_size = _check_max_size(max_size)
         with self.open(key, start, end) as stream:
+            if max_size is not None:
+                _check_get_size(key, stream.end - stream.start, 0, None, max_size)
             return stream.read()
 
     def list(
@@ -582,15 +587,22 @@ class RemoteBucket:
         while True:
             want = LIST_PAGE if limit is None else min(LIST_PAGE, limit - len(objects) - len(prefixes))
             page = self._call("list", prefix=prefix, delimiter=delimiter, limit=want, start_after=cursor)
-            if not isinstance(page, dict):
+            if not isinstance(page, dict) or not isinstance(page.get("truncated"), bool):
                 raise ProtocolError("The server sent a malformed listing.")
             objects += [_build(ObjectInfo, o) for o in page.get("objects") or []]
             prefixes += [p for p in page.get("prefixes") or [] if isinstance(p, str)]
-            cursor = page.get("next_start_after")
-            if not page.get("truncated") or not isinstance(cursor, str):
-                return ListResult(objects=objects, prefixes=prefixes)
+            if not page["truncated"]:
+                # Complete only when the server says so explicitly (older servers do not).
+                return ListResult(objects=objects, prefixes=prefixes, complete=page.get("complete") is True)
+            following = page.get("next_start_after")
+            if not isinstance(following, str) or (cursor is not None and following <= cursor):
+                raise ProtocolError(
+                    "The server cut a listing short without saying where it continues.",
+                    hint="Retry; if it keeps happening, upgrade mybucket on the server.",
+                )
+            cursor = following
             if limit is not None and len(objects) + len(prefixes) >= limit:
-                return ListResult(objects=objects, prefixes=prefixes, truncated=True, next_start_after=cursor)
+                return ListResult(objects=objects, prefixes=prefixes, truncated=True, next_start_after=cursor, complete=False)
 
     def list_versions(self, key: str) -> list[VersionInfo]:
         result = self._call("versions", key=key)

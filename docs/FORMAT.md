@@ -36,6 +36,12 @@ mybucket 0.1) are described by this same document minus the parts marked
   `blobs/ea/b4/eab43d21a7f5f0224a6e2b86b9d65c2aaa567d0fcb89279a2af01a7412edd836`.
 - Everything is created with owner-only permissions (directories `0700`,
   files `0600`).
+- There are no symbolic links inside a store, and readers must not follow
+  any: a store may come from elsewhere, and a link could point a reader (or
+  gc, which deletes files) outside it. mybucket refuses to open a bucket
+  whose folder, database files, `blobs/`, `tmp/` or fan-out folders are
+  links, and treats a blob file that is a link, or is not a regular file, as
+  damage. Only the store directory itself may be reached through a link.
 
 **Always copy `bucket.sqlite` together with its `-wal` file**, or read it in
 place: recently committed changes may live only in the WAL until SQLite
@@ -254,8 +260,10 @@ For a large raw blob (`codec = 0`) the rows have `stored_start = start` and
 ## 3. Blob files and crash safety
 
 A blob file holds the stored bytes exactly: a single zstd frame when
-`codec = 1`, the raw content when `codec = 0`. Files are never modified in
-place. The only time a file at a blob path is replaced is a repair (section
+`codec = 1`, zstd frames and a seek table when `codec = 2`, the raw content
+when `codec = 0`. It is a regular file whose size is exactly
+`blobs.stored_size`; a reader checks both before reading anything. Files are
+never modified in place. The only time a file at a blob path is replaced is a repair (section
 2.3): a new file is renamed over a damaged one, under the write lock and in
 the same transaction that updates its `blobs` row.
 
@@ -396,21 +404,49 @@ WHERE t.key = '2026/11/14/day.json' AND t.version = 1;
 ### 5.2 Recovering a whole bucket
 
 This POSIX shell script writes every current object to `<out>/<key>`
-(keys are safe paths, see section 4) and checks each file's SHA-256. It
-works on a copy of the database, so it never changes the bucket, and reads
-format 1 and format 2 buckets, dictionaries and large objects included.
-Keys that cannot all exist as files in `<out>` are reported on stderr and
-skipped while the rest is recovered, and the script then exits 1:
+and checks each file's SHA-256. It works on a copy of the database, so it
+never changes the bucket, and reads format 1 and format 2 buckets,
+dictionaries and large objects included. Anything it cannot recover safely
+is reported on stderr and skipped while the rest is recovered, and the
+script then exits 1:
 
 - a key that is also a folder of other keys (`dir` and `dir/child`);
 - keys that differ only in letter case (`A.txt` and `a.txt`) when `<out>` is
   on a case-insensitive filesystem (the macOS default). Recover into a
   case-sensitive volume, or recover the skipped keys one by one with the
-  steps of section 5.1.
+  steps of section 5.1;
+- anything a bucket written by mybucket never holds, because a bucket copied
+  from elsewhere may have been altered: a key that is not a safe relative
+  path (a leading `/`, an empty segment, or a segment starting with `.`, such
+  as `..`), a key with control characters, a row whose ids or hash are not
+  what section 2 says, and a blob file that is a symbolic link (the script
+  never follows one). A database with triggers, views, virtual tables or
+  tables mybucket does not define is refused as a whole.
+
+The script treats the database as untrusted data:
+
+- every `sqlite3` call opens the copy with `-readonly` and runs
+  `PRAGMA trusted_schema=OFF` first, so SQL stored in the database cannot
+  call functions with side effects;
+- every call uses `-safe` (no file access from SQL, sqlite3 3.37 and later)
+  when this `sqlite3` has it. Stored bytes are read as text (`base64()`,
+  sqlite3 3.41 and later, decoded with `base64 -d`; or `hex()` decoded with
+  `xxd -r -p`), so no call needs `writefile()`. Only when neither decoder is
+  available does it fall back to `writefile()`, without `-safe`;
+- nothing read from the database is ever pasted into SQL except values it
+  has checked to be whole numbers.
 
 `sqlite3` prints the columns separated by the control character U+001F,
-which no key can contain, and the key comes last, so spaces, `|` and any
-other characters in keys are safe.
+which no key can contain (keys with control characters are left out of the
+listing), and the key comes last, so spaces, `|` and any other characters
+in keys are safe.
+
+macOS's own `sqlite3` (3.51 here) cannot open a WAL-mode database with
+`-readonly` when it is idle (no `-wal` and `-shm` files next to it): it
+fails with "unable to open database file". The script therefore first
+switches its *copy* to a rollback journal (`PRAGMA journal_mode=DELETE`,
+which also folds in the copied `-wal` file); after that `-readonly` works
+everywhere.
 
 ```sh
 #!/bin/sh
@@ -426,27 +462,80 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 case "$work" in *"'"*) echo "the temp folder name $work contains a quote" >&2; exit 1 ;; esac
 
-# Work on a copy of the database and its WAL: this never changes the bucket,
-# and works with every sqlite3 (the one in macOS cannot open an idle WAL
-# database with -readonly).
+# Work on a copy of the database and its WAL: this never changes the bucket.
+for f in bucket.sqlite bucket.sqlite-wal; do
+  if [ -L "$bucket/$f" ]; then echo "refused: $bucket/$f is a symbolic link" >&2; exit 1; fi
+done
 cp -- "$bucket/bucket.sqlite" "$work/db"
 if [ -f "$bucket/bucket.sqlite-wal" ]; then cp -- "$bucket/bucket.sqlite-wal" "$work/db-wal"; fi
-# Format 2: every trained dictionary as a file, for zstd -D.
-if [ "$(sqlite3 "$work/db" "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'dicts';")" = 1 ]; then
-  for id in $(sqlite3 "$work/db" "SELECT id FROM dicts;"); do
-    sqlite3 "$work/db" "SELECT writefile('$work/dict-$id', data) FROM dicts WHERE id = $id;" > /dev/null
-  done
+
+# The database is data, never code: no trusted schema, -safe when available.
+safe=
+if sqlite3 -safe :memory: 'SELECT 1;' >/dev/null 2>&1; then safe=-safe; fi
+q() { sql=$1; shift; sqlite3 -readonly $safe "$@" -cmd 'PRAGMA trusted_schema=OFF;' "$work/db" "$sql"; }
+# Fold the copied WAL into the copy and leave WAL mode (see above), then use -readonly.
+sqlite3 $safe -cmd 'PRAGMA trusted_schema=OFF;' "$work/db" 'PRAGMA journal_mode=DELETE;' > /dev/null
+
+if [ "$(q "SELECT count(*) FROM sqlite_master WHERE type IN ('trigger', 'view') OR sql LIKE 'CREATE VIRTUAL%'
+      OR (type = 'table' AND name NOT IN ('meta', 'blobs', 'objects', 'trash', 'dicts', 'frames', 'sqlite_sequence',
+          'sqlite_stat1', 'sqlite_stat4') AND substr(name, 1, 2) <> 'x_');")" != 0 ]; then
+  echo "refused: this database has triggers, views or tables that mybucket does not write" >&2
+  exit 1
 fi
-sep=$(printf '\037')
-sqlite3 -separator "$sep" "$work/db" "SELECT b.codec, b.data IS NULL, lower(hex(b.hash)), coalesce(b.dict_id, ''), o.key
-  FROM objects o JOIN blobs b ON b.id = o.blob_id ORDER BY o.key;" > "$work/list"
 
-sha256() { if command -v sha256sum >/dev/null; then sha256sum < "$1"; else shasum -a 256 < "$1"; fi | cut -d' ' -f1; }
+# How stored bytes come out of the database: as text, decoded here.
+if [ "$(q "SELECT base64(x'00ff');" 2>/dev/null)" = "AP8=" ] &&
+   [ "$(printf 'AP8=' | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 00ff ]; then
+  decoder=base64
+elif command -v xxd > /dev/null; then
+  decoder=hex
+else
+  decoder=writefile
+fi
+# extract TABLE ID FILE: the data column of that row (ID is checked to be digits) into FILE.
+extract() {
+  case $decoder in
+    base64) q "SELECT base64(data) FROM $1 WHERE id = $2;" | base64 -d > "$3" ;;
+    hex) q "SELECT hex(data) FROM $1 WHERE id = $2;" | xxd -r -p > "$3" ;;
+    *) sqlite3 -readonly -cmd 'PRAGMA trusted_schema=OFF;' "$work/db" \
+         "SELECT writefile('$3', data) FROM $1 WHERE id = $2;" > /dev/null ;;
+  esac
+}
+is_number() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
 skip() { echo "skipped $1: $2" >&2; failed=1; }
-
+sha256() { if command -v sha256sum >/dev/null; then sha256sum < "$1"; else shasum -a 256 < "$1"; fi | cut -d' ' -f1; }
 failed=0
+
+# Format 2: every trained dictionary as a file, for zstd -D.
+if [ "$(q "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'dicts';")" = 1 ]; then
+  for id in $(q "SELECT id FROM dicts WHERE typeof(id) = 'integer';"); do
+    if is_number "$id"; then extract dicts "$id" "$work/dict-$id"; fi
+  done
+  n=$(q "SELECT count(*) FROM dicts WHERE typeof(id) <> 'integer';")
+  if [ "$n" != 0 ]; then skip "$n dictionaries" "their id is not a whole number"; fi
+fi
+
+sep=$(printf '\037')
+nokey="('*[' || char(1) || '-' || char(31) || char(127) || ']*')"
+n=$(q "SELECT count(*) FROM objects WHERE typeof(key) <> 'text' OR key GLOB $nokey;")
+if [ "$n" != 0 ]; then skip "$n objects" "their keys hold control characters or are not text"; fi
+q "SELECT b.id, b.codec, b.data IS NULL, lower(hex(b.hash)), coalesce(b.dict_id, ''), o.key
+  FROM objects o JOIN blobs b ON b.id = o.blob_id
+  WHERE typeof(o.key) = 'text' AND NOT o.key GLOB $nokey ORDER BY o.key;" -separator "$sep" > "$work/list"
+
 mkdir -p -- "$out"
-while IFS=$sep read -r codec in_file hash dict key; do
+while IFS=$sep read -r id codec in_file hash dict key; do
+  case "/$key/" in
+    *//* | */.*) skip "$key" "it is not a safe relative path (a leading '/', an empty segment or a segment starting with '.')"; continue ;;
+  esac
+  if ! is_number "$id" || ! { [ "$codec" = 0 ] || [ "$codec" = 1 ] || [ "$codec" = 2 ]; } ||
+     ! { [ "$in_file" = 0 ] || [ "$in_file" = 1 ]; } || [ ${#hash} -ne 64 ] ||
+     { [ -n "$dict" ] && ! is_number "$dict"; }; then
+    skip "$key" "its database row is malformed"
+    continue
+  fi
+  case $hash in *[!0-9a-f]*) skip "$key" "its database row is malformed"; continue ;; esac
+  if [ -n "$dict" ] && [ ! -f "$work/dict-$dict" ]; then skip "$key" "its dictionary $dict is missing"; continue; fi
   dest="$out/$key"
   case "$key" in */*) dir="$out/${key%/*}" ;; *) dir="$out" ;; esac
   if [ -e "$dest" ] || [ -L "$dest" ]; then
@@ -458,10 +547,16 @@ while IFS=$sep read -r codec in_file hash dict key; do
     continue
   fi
   if [ "$in_file" = 1 ]; then
-    src="$bucket/blobs/$(echo "$hash" | cut -c1-2)/$(echo "$hash" | cut -c3-4)/$hash"
+    h1=$(echo "$hash" | cut -c1-2)
+    h2=$(echo "$hash" | cut -c3-4)
+    src="$bucket/blobs/$h1/$h2/$hash"
+    if [ -L "$bucket/blobs" ] || [ -L "$bucket/blobs/$h1" ] || [ -L "$bucket/blobs/$h1/$h2" ] || [ -L "$src" ] || [ ! -f "$src" ]; then
+      skip "$key" "its stored file is missing or is a symbolic link"
+      continue
+    fi
   else
     src="$work/stored"
-    sqlite3 "$work/db" "SELECT writefile('$src', data) FROM blobs WHERE hash = x'$hash';" > /dev/null
+    extract blobs "$id" "$src"
   fi
   if [ "$codec" = 0 ]; then
     cp -- "$src" "$dest" || { rm -f -- "$dest"; skip "$key" "its stored file cannot be copied"; continue; }
@@ -475,11 +570,13 @@ done < "$work/list"
 exit "$failed"
 ```
 
-The script needs `sqlite3`, `zstd`, and `sha256sum` or `shasum`. A failure
+The script needs `sqlite3`, `zstd`, `sha256sum` or `shasum`, and `base64`
+or `xxd` (both ship with macOS and most Linux systems). A failure
 of `sqlite3` itself (for example a damaged database) stops it at once with a
 non-zero exit status. tests/test_format_doc.py runs this exact script, on
 format 1 and format 2 buckets with dictionaries, large objects and keys with
-spaces and non-ASCII characters.
+spaces and non-ASCII characters, and on altered databases whose rows it must
+skip.
 
 ### 5.3 Export manifest
 
@@ -526,8 +623,15 @@ Take a snapshot first if you may need to go back to 0.1.
 
 - Readers must check `PRAGMA application_id` and refuse `meta.format`
   values greater than they know.
+- Readers must treat the database as untrusted: open it with
+  `PRAGMA trusted_schema=OFF`, and refuse a database whose tables and
+  indexes are not exactly the ones of section 2.1 (whitespace aside), or
+  that has triggers, views or virtual tables. mybucket does this on every
+  open.
 - Readers must refuse blobs with an unknown `codec`, and must not decode a
   blob whose `dict_id` names a dictionary they cannot find (that is damage,
   not something to guess around).
-- Later formats may add tables and columns. They will bump `format` when an
-  older reader could otherwise misread data.
+- Later versions never change the definition of a table or index of
+  section 2.1 without bumping `format`. They may add plain tables whose
+  names start with `x_` (and indexes on them) without bumping it; older
+  readers ignore those. Any other change bumps `format`.

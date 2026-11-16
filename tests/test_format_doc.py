@@ -277,3 +277,56 @@ def test_recover_script_on_a_format_1_store_before_and_after_upgrade(tmp_path):
             conn = sqlite3.connect(bdir / "bucket.sqlite")
             assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
             conn.close()
+
+
+@needs_tools
+def test_recover_script_skips_rows_a_mybucket_bucket_never_holds(tmp_path):
+    """Audit A1: an altered copy of a bucket is read as data; unsafe rows are skipped and reported."""
+    script = tmp_path / "recover.sh"
+    script.write_text(_recover_script())
+    script.chmod(0o755)
+    store = open_store(tmp_path / "store")
+    b = store.bucket("box", create=True)
+    b.put("good.txt", b"x")
+    b.put("dir/also-good.txt", b"fine")
+    store.close()
+    bdir = tmp_path / "store" / "buckets" / "box"
+    conn = sqlite3.connect(bdir / "bucket.sqlite")
+    blob_id = conn.execute("SELECT blob_id FROM objects WHERE key = 'good.txt'").fetchone()[0]
+    for key in ("../outside.txt", "/leading-slash.txt", "dir/./dot.txt", ".hidden", "empty//segment.txt"):
+        conn.execute(
+            "INSERT INTO objects (key, version, blob_id, content_type, meta, modified) VALUES (?, 99, ?, NULL, NULL, 0)",
+            (key, blob_id),
+        )
+    # A dicts table whose id column accepts text, holding a row with a non-numeric id.
+    conn.execute("DROP TABLE dicts")
+    conn.execute("CREATE TABLE dicts (id, hash, zstd_id, data, created_at, samples, prefix)")
+    conn.execute("INSERT INTO dicts VALUES ('not-a-number', x'00', 0, x'00', 0, 0, '')")
+    conn.commit()
+    conn.close()
+    out = tmp_path / "out" / "inner"
+    proc = subprocess.run([str(script), str(bdir), str(out)], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 1, proc.stderr
+    for key in ("../outside.txt", "/leading-slash.txt", "dir/./dot.txt", ".hidden", "empty//segment.txt"):
+        assert f"skipped {key}: it is not a safe relative path" in proc.stderr, proc.stderr
+    assert "skipped 1 dictionaries: their id is not a whole number" in proc.stderr
+    assert not (tmp_path / "out" / "outside.txt").exists() and not (out / ".hidden").exists()
+    assert not (out / "dir" / "dot.txt").exists()
+    assert (out / "good.txt").read_bytes() == b"x" and (out / "dir" / "also-good.txt").read_bytes() == b"fine"
+
+
+@needs_tools
+def test_recover_script_refuses_a_database_with_triggers(tmp_path):
+    script = tmp_path / "recover.sh"
+    script.write_text(_recover_script())
+    script.chmod(0o755)
+    with open_store(tmp_path / "store") as store:
+        store.bucket("box", create=True).put("good.txt", b"x")
+    bdir = tmp_path / "store" / "buckets" / "box"
+    conn = sqlite3.connect(bdir / "bucket.sqlite")
+    conn.execute("CREATE TRIGGER note AFTER INSERT ON meta BEGIN SELECT 1; END")
+    conn.commit()
+    conn.close()
+    proc = subprocess.run([str(script), str(bdir), str(tmp_path / "out")], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 1 and "refused" in proc.stderr
+    assert not (tmp_path / "out" / "good.txt").exists()

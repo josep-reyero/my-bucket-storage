@@ -44,6 +44,7 @@ from .errors import (
     EXIT_NOT_ALLOWED,
     EXIT_NOT_FOUND,
     EXIT_OK,
+    EXIT_REFUSED,
     EXIT_USAGE,
     BucketNotEmpty,
     BucketNotFound,
@@ -164,7 +165,29 @@ def _cli_hints() -> dict[str, str]:
     return hints
 
 
-def _human_size(n: int) -> str:
+_UNSAFE_TEXT_RE = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u061c\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff\ud800-\udfff]"
+)
+
+
+def _escape_char(m: re.Match) -> str:
+    c = ord(m.group())
+    return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}"
+
+
+def _safe(text: object) -> str:
+    """``text`` for a terminal: control and invisible characters shown as \\xNN / \\uNNNN.
+
+    A store from elsewhere may hold keys, content types or metadata with
+    characters no valid key has (terminal escape sequences, direction
+    overrides); printing them raw could rewrite what the screen shows.
+    """
+    return _UNSAFE_TEXT_RE.sub(_escape_char, str(text))
+
+
+def _human_size(n: int | None) -> str:
+    if n is None:
+        return "-"
     if n < 1024:
         return f"{n} B"
     value = float(n)
@@ -403,10 +426,10 @@ def cmd_put(ctx: Context, ns) -> int:
             )
     data = info.to_dict()
     if info.status == "unchanged":
-        human = f"unchanged {info.key} (the same content and metadata are already stored)"
+        human = f"unchanged {_safe(info.key)} (the same content and metadata are already stored)"
     else:
         human = (
-            f"{info.status} {info.key} ({_human_size(info.size)}, stored as {_human_size(info.stored_size)}, "
+            f"{info.status} {_safe(info.key)} ({_human_size(info.size)}, stored as {_human_size(info.stored_size)}, "
             f"version {info.version}, etag {info.etag})"
         )
     if info.repaired:
@@ -481,7 +504,7 @@ def cmd_get(ctx: Context, ns) -> int:
     tmp = parent / f".{dest.name}.mybucket-{secrets.token_hex(4)}.part"
     with bucket.open(ns.key, *_range(ns)) as stream:
         info = stream.info
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "wb") as fp:
                 _copy_stream(stream, fp.write)
@@ -499,9 +522,9 @@ def cmd_get(ctx: Context, ns) -> int:
     data["path"] = str(dest)
     if stream.start or stream.end != info.size:
         data["range"] = {"start": stream.start, "end": stream.end}
-        ctx.emit(data, f"Wrote bytes {stream.start}-{stream.end} of {info.key} to {dest} ({_human_size(stream.end - stream.start)}).")
+        ctx.emit(data, f"Wrote bytes {stream.start}-{stream.end} of {_safe(info.key)} to {_safe(dest)} ({_human_size(stream.end - stream.start)}).")
     else:
-        ctx.emit(data, f"Wrote {info.key} to {dest} ({_human_size(info.size)}).")
+        ctx.emit(data, f"Wrote {_safe(info.key)} to {_safe(dest)} ({_human_size(info.size)}).")
     return EXIT_OK
 
 
@@ -517,17 +540,17 @@ def cmd_cat(ctx: Context, ns) -> int:
 
 def _info_lines(info) -> list[str]:
     lines = [
-        f"key:          {info.key}",
+        f"key:          {_safe(info.key)}",
         f"size:         {info.size} ({_human_size(info.size)})",
-        f"stored size:  {info.stored_size} ({_human_size(info.stored_size)})",
+        f"stored size:  {'-' if info.stored_size is None else info.stored_size} ({_human_size(info.stored_size)})",
         f"etag:         {info.etag}",
-        f"content type: {info.content_type or '-'}",
+        f"content type: {_safe(info.content_type or '-')}",
         f"modified:     {_when(info.modified)}",
         f"version:      {info.version}",
     ]
     if info.metadata:
         lines.append("metadata:")
-        lines.extend(f"  {k}: {v}" for k, v in sorted(info.metadata.items()))
+        lines.extend(f"  {_safe(k)}: {_safe(v)}" for k, v in sorted(info.metadata.items()))
     return lines
 
 
@@ -566,12 +589,12 @@ def cmd_ls(ctx: Context, ns) -> int:
                 if ctx.json:
                     prefixes.append(entry)
                 else:
-                    print(f"{'':19}  {'PRE':>10}  {entry}")
+                    print(f"{'':19}  {'PRE':>10}  {_safe(entry)}")
             else:
                 if ctx.json:
                     objects.append(entry.to_dict())
                 else:
-                    print(f"{_when(entry.modified)}  {_human_size(entry.size):>10}  {entry.key}")
+                    print(f"{_when(entry.modified)}  {_human_size(entry.size):>10}  {_safe(entry.key)}")
         if remaining is not None:
             remaining -= len(page)
         if not page.truncated:
@@ -587,7 +610,7 @@ def cmd_ls(ctx: Context, ns) -> int:
     else:
         sys.stdout.flush()
         if truncated:
-            ctx.note(f"(more results; continue with --start-after {next_start_after})")
+            ctx.note(f"(more results; continue with --start-after {_safe(next_start_after)})")
         elif shown == 0:
             ctx.note("(nothing found)" if prefix else "(the bucket is empty)")
     return EXIT_OK
@@ -612,8 +635,8 @@ def cmd_rm(ctx: Context, ns) -> int:
     missing = [key for key, info in zip(wanted, results, strict=True) if info is None]
     days = bucket.trash_days
     kept = f"kept in the trash for {days} days" if days else "not kept: this bucket's trash is off"
-    lines = [f"deleted {info.key} ({kept})" for info in deleted]
-    lines += [f"not found {key} (nothing to delete)" for key in missing]
+    lines = [f"deleted {_safe(info.key)} ({kept})" for info in deleted]
+    lines += [f"not found {_safe(key)} (nothing to delete)" for key in missing]
     ctx.emit({"deleted": [i.to_dict() for i in deleted], "missing": missing}, lines)
     return EXIT_OK
 
@@ -665,7 +688,7 @@ def cmd_export(ctx: Context, ns) -> int:
         human += f", {result['gone']} deleted while exporting"
     ctx.emit(result, human + ".")
     for item in result["conflicts"][:20]:
-        ctx.note(f"  skipped {item['key']}: {item['reason']}")
+        ctx.note(f"  skipped {_safe(item['key'])}: {_safe(item['reason'])}")
     if result["skipped"] > 20:
         ctx.note(f"  ... and {result['skipped'] - 20} more (use --json to see up to 50)")
     return EXIT_OK
@@ -698,7 +721,7 @@ def cmd_import(ctx: Context, ns) -> int:
         error.code = "files_skipped"
     code = _emit_with_damage(ctx, result, [human], error, quiet_error=True)
     for item in result["skipped_entries"][:20]:
-        ctx.note(f"  skipped {item['path']}: {item['reason']}")
+        ctx.note(f"  skipped {_safe(item['path'])}: {_safe(item['reason'])}")
     if skipped > 20:
         ctx.note(f"  ... and {skipped - 20} more (use --json to see up to 50)")
     if error is not None and not ctx.json:
@@ -753,10 +776,10 @@ def _damage_lines(report: dict) -> list[str]:
         users = item.get("versions") or [{"key": f"(content {str(item.get('etag', ''))[:16]}...)", "version": "?", "current": False}]
         for user in users:
             state = "current" if user.get("current") else "in the trash"
-            lines.append(f"- {user.get('key')} (version {user.get('version')}, {state}): {where} is damaged: {problem}.")
+            lines.append(f"- {_safe(user.get('key'))} (version {user.get('version')}, {state}): {where} is damaged: {_safe(problem)}.")
     for item in report.get("missing_content") or []:
         state = "current" if item.get("current") else "in the trash"
-        lines.append(f"- {item.get('key')} (version {item.get('version')}, {state}): its content is missing.")
+        lines.append(f"- {_safe(item.get('key'))} (version {item.get('version')}, {state}): its content is missing.")
     return lines
 
 
@@ -909,7 +932,16 @@ def cmd_sync(ctx: Context, ns) -> int:
     try:
         dst = _open_any(ns.dst, write=not ns.dry_run, timeout=ctx.timeout, create=not ns.dry_run)
         try:
-            report = sync(src, dst, buckets=ns.buckets or None, prefix=ns.prefix, delete=ns.delete, dry_run=ns.dry_run)
+            report = sync(
+                src,
+                dst,
+                buckets=ns.buckets or None,
+                prefix=ns.prefix,
+                delete=ns.delete,
+                dry_run=ns.dry_run,
+                max_delete=ns.max_delete,
+                force=ns.force,
+            )
         finally:
             dst.close()
     finally:
@@ -926,11 +958,21 @@ def cmd_sync(ctx: Context, ns) -> int:
             line += f", {r['extra_in_destination']:,} only in the destination"
         lines.append(line)
         for item in (r["damaged"] + r["conflicts"])[:20]:
-            lines.append(f"  not copied {item['key']}: {item['reason']}")
-    lines.append(report["summary"])
+            lines.append(f"  not copied {_safe(item['key'])}: {_safe(item['reason'])}")
+        if r.get("delete_refused"):
+            lines.append(f"  nothing deleted: {r['delete_refused']}")
+    lines.append(_safe(report["summary"]))
     if report["hint"]:
         lines.append(f"  {report['hint']}")
     error = None
+    if report.get("delete_refused"):
+        error = MyBucketError(
+            "Deleting in the destination was refused for safety (see above); everything else was synced.",
+            hint="Check that the source is complete. If the deletes are intended, pass --max-delete N or --force.",
+        )
+        error.code, error.exit_code = "delete_refused", EXIT_REFUSED
+        _emit_with_damage(ctx, report, lines, error)
+        return EXIT_REFUSED
     if not report["ok"]:
         error = MyBucketError(
             "Some objects were not copied (listed above).",
@@ -1159,6 +1201,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-b", "--bucket", dest="buckets", action="append", metavar="BUCKET", help="only this bucket (repeatable; default: all)")
     p.add_argument("--prefix", default="", help="only keys starting with this")
     p.add_argument("--delete", action="store_true", help="also delete destination objects the source no longer has (they go to its trash)")
+    p.add_argument(
+        "--max-delete",
+        type=int,
+        metavar="N",
+        help="with --delete, delete at most N objects per bucket (default: half of the destination's objects, at least 10)",
+    )
+    p.add_argument("--force", action="store_true", help="with --delete, no limit on how many objects are deleted")
     p.add_argument("-n", "--dry-run", action="store_true", help="only report what would change")
 
     p = add(
@@ -1224,9 +1273,9 @@ def _report(error: MyBucketError, json_mode: bool, usage: str | None = None) -> 
     else:
         if usage:
             sys.stderr.write(usage)
-        sys.stderr.write(f"mybucket: {error.message}\n")
+        sys.stderr.write(f"mybucket: {_safe(error.message)}\n")
         if error.hint:
-            sys.stderr.write(f"  {error.hint}\n")
+            sys.stderr.write(f"  {_safe(error.hint)}\n")
         sys.stderr.flush()
     return error.exit_code
 
@@ -1274,7 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
         _report(error, ctx.json)
         return 130
     except Exception as exc:  # a bug: say so plainly, keep the details for a report
-        if os.environ.get("MYBUCKET_DEBUG"):
+        if os.environ.get("MYBUCKET_DEBUG") and ns.command != "serve":  # never a traceback to a remote client
             raise
         error = MyBucketError(
             f"Unexpected internal error: {type(exc).__name__}: {exc}",

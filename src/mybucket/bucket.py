@@ -3,7 +3,9 @@
 Public (``Bucket``):
     put(key, data, content_type=None, metadata=None, if_match=None, if_none_match=None,
         expected_size=None, expected_sha256=None) -> PutInfo
-    get(key, start=None, end=None) -> bytes      the object, or bytes [start, end) of it
+    get(key, start=None, end=None, max_size=GET_MAX) -> bytes
+                                         the object, or bytes [start, end) of it
+                                         (refused above max_size, 1 GiB by default)
     open(key, start=None, end=None) -> ObjectStream
                                          buffered binary stream with ``.info``, ``.verified``
     head(key) -> ObjectInfo              raises ObjectNotFound
@@ -121,7 +123,9 @@ from .errors import (
     ObjectNotFound,
     PreconditionFailed,
     ReadOnlyError,
+    Refused,
     StoreError,
+    UnsafeStore,
     from_os_error,
 )
 from .models import (
@@ -138,6 +142,13 @@ from .schema import DB_NAME, FORMAT_VERSION, check_db, connect, has_table, trans
 
 if TYPE_CHECKING:
     from .store import Store
+
+#: The first bytes of every zstd dictionary (zstd's dictionary magic number).
+_ZSTD_DICT_MAGIC = bytes.fromhex("37a430ec")
+#: get() refuses to return more than this many bytes unless the caller asks for more.
+GET_MAX = 1 << 30
+#: The largest version number SQLite can store.
+MAX_VERSION = (1 << 63) - 1
 
 REASON_OVERWRITTEN = "overwritten"
 REASON_DELETED = "deleted"
@@ -178,8 +189,25 @@ class _Current(NamedTuple):
         )
 
 
+def _current_row(row) -> _Current:
+    """A row of _CURRENT_SQL, checked: a database from elsewhere may hold values of any type."""
+    cur = _Current(*row)
+    ints = (cur.version, cur.blob_id, cur.modified, cur.size, cur.stored_size)
+    ok = (
+        isinstance(cur.key, str)
+        and all(isinstance(v, int) and not isinstance(v, bool) for v in ints)
+        and isinstance(cur.hash, bytes)
+        and len(cur.hash) == 32
+        and (cur.content_type is None or isinstance(cur.content_type, str))
+        and (cur.meta is None or isinstance(cur.meta, str))
+    )
+    if not ok:
+        raise DamagedError(f"The database row of object {cur.key!r} is damaged: it holds values of the wrong type.")
+    return cur
+
+
 _CURRENT_SQL = (
-    "SELECT o.key, o.version, o.blob_id, o.content_type, o.meta, o.modified, b.hash, b.size, b.stored_size "
+    "SELECT o.key, o.version, o.blob_id, o.content_type, o.meta, o.modified, CAST(b.hash AS BLOB), b.size, b.stored_size "
     "FROM objects o CROSS JOIN blobs b ON b.id = o.blob_id"
 )
 
@@ -263,7 +291,17 @@ class Bucket:
         self._local = threading.local()  # per-thread state (the open batch)
         self._dicts: dict[int, LoadedDict] = {}  # dicts rows never change, so they can be cached
         self._has_frames: bool | None = None
-        self._conn: sqlite3.Connection | None = connect(self.db_path, readonly=readonly, timeout=timeout)
+        #: False for a handle that must not compress with the bucket's dictionary
+        #: (a prefix-scoped remote connection: see server.py).
+        self.use_dictionary = True
+        self._conn: sqlite3.Connection | None = None
+        problem = _blobs.link_problem(self.path)
+        if problem is not None:
+            raise UnsafeStore(
+                f"Bucket {name!r} was not opened: {problem}. mybucket never follows links inside a "
+                "store, because they could make it read, change or delete files outside the store."
+            )
+        self._conn = connect(self.db_path, readonly=readonly, timeout=timeout)
         try:
             meta = check_db(self._conn)
             self._identity = self._file_identity()
@@ -405,15 +443,15 @@ class Bucket:
 
     def _current(self, conn: sqlite3.Connection, key: str) -> _Current | None:
         row = conn.execute(_CURRENT_SQL + " WHERE o.key = ?", (key,)).fetchone()
-        return _Current(*row) if row else None
+        return _current_row(row) if row else None
 
     def _trash_entry(self, conn: sqlite3.Connection, key: str, version: int) -> _Current | None:
         row = conn.execute(
-            "SELECT t.key, t.version, t.blob_id, t.content_type, t.meta, t.modified, b.hash, b.size, b.stored_size "
-            "FROM trash t CROSS JOIN blobs b ON b.id = t.blob_id WHERE t.key = ? AND t.version = ?",
+            "SELECT t.key, t.version, t.blob_id, t.content_type, t.meta, t.modified, CAST(b.hash AS BLOB), b.size, "
+            "b.stored_size FROM trash t CROSS JOIN blobs b ON b.id = t.blob_id WHERE t.key = ? AND t.version = ?",
             (key, version),
         ).fetchone()
-        return _Current(*row) if row else None
+        return _current_row(row) if row else None
 
     def _blob_row(self, conn: sqlite3.Connection, blob_id: int) -> BlobRow | None:
         row = conn.execute(f"SELECT {BLOB_COLUMNS} FROM blobs WHERE id = ?", (blob_id,)).fetchone()
@@ -431,24 +469,37 @@ class Bucket:
         if not self._frames_table(conn):
             return None
         # CAST: a damaged row holding TEXT must be reported as damage, not fail to decode.
-        row = conn.execute("SELECT CAST(hash AS BLOB), CAST(data AS BLOB) FROM dicts WHERE id = ?", (dict_id,)).fetchone()
+        row = conn.execute(
+            "SELECT CAST(hash AS BLOB), CAST(data AS BLOB), zstd_id FROM dicts WHERE id = ?", (dict_id,)
+        ).fetchone()
         if row is None:
             return None
-        digest, data = row
+        digest, data, zstd_id = row
         if not isinstance(data, bytes) or hashlib.sha256(data).digest() != digest:
             raise DamagedError(
                 f"Dictionary {dict_id} of bucket {self.name!r} is damaged, so the objects "
                 "compressed with it cannot be read."
             )
         try:
-            loaded = LoadedDict(dict_id, digest, _zstd.Dictionary(data))
-        except (_zstd.ZstdError, ValueError, TypeError) as exc:
-            raise DamagedError(f"Dictionary {dict_id} of bucket {self.name!r} cannot be loaded ({exc}).") from None
+            if not data.startswith(_ZSTD_DICT_MAGIC):
+                raise ValueError("it is not a zstd dictionary")
+            dictionary = _zstd.Dictionary(data)
+            if dictionary.zstd_id == 0 or dictionary.zstd_id != zstd_id:
+                raise ValueError("its dictionary ID does not match its row")
+            probe = b"mybucket dictionary check " * 8
+            packed = _zstd.compress(probe, 1, dictionary)
+            if _zstd.Decompressor(dictionary).decompress(packed, len(probe) + 1) != probe:
+                raise ValueError("it does not compress and decompress correctly")
+            loaded = LoadedDict(dict_id, digest, dictionary)
+        except (_zstd.ZstdError, ValueError, TypeError, MemoryError) as exc:
+            raise DamagedError(f"Dictionary {dict_id} of bucket {self.name!r} cannot be used ({exc}).") from None
         self._dicts[dict_id] = loaded
         return loaded
 
     def _active_dict(self, conn: sqlite3.Connection | None = None) -> LoadedDict | None:
         """The dictionary new small objects are compressed with, or None."""
+        if not self.use_dictionary:
+            return None
         if conn is None:
             with self._locked_conn() as locked:
                 return self._active_dict(locked)
@@ -457,7 +508,7 @@ class Bucket:
             return None
         try:
             return self._load_dict(conn, int(value))
-        except DamagedError:
+        except (DamagedError, ValueError, TypeError, OverflowError):
             return None  # never compress new data with a damaged dictionary; verify reports it
 
     def _frames_table(self, conn: sqlite3.Connection) -> bool:
@@ -499,13 +550,29 @@ class Bucket:
         row = conn.execute("SELECT v FROM meta WHERE k = ?", (name,)).fetchone()
         return None if row is None else row[0]
 
+    def _meta_int(self, conn: sqlite3.Connection, name: str, low: int, high: int) -> int:
+        """A whole-number bucket setting, or StoreError when the stored value is not one in range."""
+        value = self._meta_value(conn, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise StoreError(
+                f"The setting {name!r} of bucket {self.name!r} is damaged (it holds {str(value)[:40]!r}).",
+                hint="Restore the bucket from a snapshot or backup.",
+            )
+        return value
+
     def _next_version(self, conn: sqlite3.Connection) -> int:
-        version = int(self._meta_value(conn, "last_version")) + 1
+        last = self._meta_int(conn, "last_version", 0, MAX_VERSION)
+        if last >= MAX_VERSION:
+            raise StoreError(
+                f"Bucket {self.name!r} has used up its version numbers, so nothing more can be written to it.",
+                hint="Copy its objects to a new bucket (mybucket sync or export and import).",
+            )
+        version = last + 1
         conn.execute("UPDATE meta SET v = ? WHERE k = 'last_version'", (version,))
         return version
 
     def _move_to_trash(self, txn: _Txn, previous: _Current, reason: str) -> None:
-        days = int(self._meta_value(txn.conn, "trash_days"))
+        days = self._meta_int(txn.conn, "trash_days", 0, 36500)
         if days <= 0:
             return
         txn.conn.execute(
@@ -893,11 +960,13 @@ class Bucket:
     @property
     def trash_days(self) -> int:
         with self._locked_conn() as conn:
-            return int(self._meta_value(conn, "trash_days"))
+            return self._meta_int(conn, "trash_days", 0, 36500)
 
     # -- public API: reads -------------------------------------------------
 
-    def _open_reader(self, key: str, start: int = 0, end: int | None = None) -> tuple[ObjectInfo, BlobReader]:
+    def _open_reader(
+        self, key: str, start: int = 0, end: int | None = None, verify_first: bool = True, max_size: int | None = None
+    ) -> tuple[ObjectInfo, BlobReader]:
         key = _keys.validate_key(key)
         for _attempt in range(3):
             try:
@@ -909,23 +978,30 @@ class Bucket:
                 raise translate_sqlite_error(exc, f"read {key!r}") from exc
             if current is None or row is None:
                 raise ObjectNotFound(f"Object {key!r} does not exist in bucket {self.name!r}.")
+            if max_size is not None:
+                _check_get_size(key, current.size, start, end, max_size)
             try:
-                reader = BlobReader(self.path, row, repr(key), frames, dictionary, start, end)
+                reader = BlobReader(self.path, row, repr(key), frames, dictionary, start, end, verify_first=verify_first)
                 return current.info(), reader
             except FileNotFoundError:
                 continue  # gc may have removed it after our snapshot; look again
         raise DamagedError(f"Object {key!r} is damaged: its blob file is missing.")
 
-    def get(self, key: str, start: int | None = None, end: int | None = None) -> bytes:
+    def get(self, key: str, start: int | None = None, end: int | None = None, max_size: int | None = GET_MAX) -> bytes:
         """Return the content of ``key``, or only bytes ``[start, end)`` of it.
 
         Like a Python slice: ``end`` is not included, ``end=None`` means up
         to the end, and a range beyond the end of the object is cut short
         (``get(key, size + 10)`` is ``b""``). Every byte returned has been
         checked against its SHA-256. Raises ObjectNotFound or DamagedError.
+
+        ``get()`` holds the result in memory, so it refuses (Refused) a
+        result larger than ``max_size`` bytes (1 GiB by default); stream
+        larger objects with ``open()``, or pass ``max_size=None``.
         """
         first, end = _check_range(start, end)
-        _info, reader = self._open_reader(key, first, end)
+        max_size = _check_max_size(max_size)
+        _info, reader = self._open_reader(key, first, end, verify_first=False, max_size=max_size)
         with reader:
             return reader.readall()
 
@@ -1031,7 +1107,7 @@ class Bucket:
                                 cursor, inclusive = _successor(common), True
                                 jumped = True
                                 break
-                        objects.append(_Current(*row).info())
+                        objects.append(_current_row(row).info())
                         count += 1
                         last = key
                         cursor, inclusive = key, False
@@ -1044,6 +1120,7 @@ class Bucket:
             prefixes=prefixes,
             truncated=truncated,
             next_start_after=last if truncated else None,
+            complete=not truncated,
         )
 
     def list_versions(self, key: str) -> list[VersionInfo]:
@@ -1070,7 +1147,7 @@ class Bucket:
                         )
                     )
                 rows = conn.execute(
-                    "SELECT t.version, b.hash, b.size, t.content_type, t.meta, t.modified, t.trashed_at, "
+                    "SELECT t.version, CAST(b.hash AS BLOB), b.size, t.content_type, t.meta, t.modified, t.trashed_at, "
                     "t.expires_at, t.reason FROM trash t CROSS JOIN blobs b ON b.id = t.blob_id "
                     "WHERE t.key = ? ORDER BY t.version DESC",
                     (key,),
@@ -1112,7 +1189,7 @@ class Bucket:
                     "coalesce(sum(data IS NOT NULL), 0), coalesce(sum(CASE WHEN data IS NULL THEN stored_size END), 0) "
                     "FROM blobs"
                 ).fetchone()
-                trash_days = int(self._meta_value(conn, "trash_days"))
+                trash_days = self._meta_int(conn, "trash_days", 0, 36500)
                 dict_blobs = conn.execute("SELECT count(*) FROM blobs WHERE dict_id IS NOT NULL").fetchone()[0]
                 n_dicts = dict_bytes = 0
                 active = self._meta_value(conn, "active_dict")
@@ -1253,6 +1330,27 @@ class Batch:
             raise
         finally:
             self._discard()
+
+
+def _check_max_size(max_size: object) -> int | None:
+    if max_size is not None and (isinstance(max_size, bool) or not isinstance(max_size, int) or max_size < 0):
+        raise InvalidArgument(
+            f"max_size must be a whole number of bytes >= 0 or None, got {max_size!r}.",
+            hint="Leave it out for the 1 GiB default, or pass None for no limit.",
+        )
+    return max_size  # type: ignore[return-value]
+
+
+def _check_get_size(key: str, size: int, start: int, end: int | None, max_size: int) -> None:
+    """Refused when get() would return more than ``max_size`` bytes (``size`` is the object's)."""
+    stop = size if end is None else min(end, size)
+    wanted = max(0, stop - min(start, size))
+    if wanted > max_size:
+        raise Refused(
+            f"get() of {key!r} would return {wanted:,} bytes, more than its limit of {max_size:,} bytes, "
+            "so nothing was read.",
+            hint="Stream it with open() (or 'mybucket get' to a file), or pass max_size=None to get() if it fits in memory.",
+        )
 
 
 def _normalize_expected(size: object, sha256: object) -> tuple[int | None, str | None]:

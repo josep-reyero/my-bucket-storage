@@ -121,6 +121,8 @@ else:  # only used when neither the stdlib module nor the backport exists
         ) from exc
 
     ZstdError = _zs.ZstdError
+    #: The most a fallback Decompressor buffers from one frame (above max_length).
+    FALLBACK_BUFFER_MAX = 64 * 1024 * 1024
 
     class Dictionary:  # type: ignore[no-redef]
         def __init__(self, content: bytes) -> None:
@@ -149,10 +151,13 @@ else:  # only used when neither the stdlib module nor the backport exists
     class Decompressor:  # type: ignore[no-redef]
         """bz2-style incremental decompressor built on zstandard's decompressobj.
 
-        zstandard cannot bound the output of one call, so whatever one input
-        chunk expands to is buffered here and handed out ``max_length`` bytes
-        at a time. The engine only uses this class on input of known small
-        size; streaming reads go through FrameReader, which is bounded.
+        zstandard cannot bound the output of one call, so the first call
+        refuses (ZstdError) a frame whose header does not declare its content
+        size, or declares more than ``max(max_length, 64 MiB)``; zstd itself
+        refuses a frame that produces more than it declares, so what is
+        buffered here stays bounded. The engine only uses this
+        class on whole frames it compressed in one go (they always declare
+        their size); streaming reads go through FrameReader, which is bounded.
         """
 
         def __init__(self, dictionary: Dictionary | None = None) -> None:
@@ -162,6 +167,7 @@ else:  # only used when neither the stdlib module nor the backport exists
                 self._d = _zs.ZstdDecompressor(dict_data=dictionary._d).decompressobj()
             self._pending = b""
             self._frame_done = False
+            self._started = False
             self.unused_data = b""
 
         @property
@@ -175,6 +181,19 @@ else:  # only used when neither the stdlib module nor the backport exists
 
         def decompress(self, data: bytes, max_length: int = -1) -> bytes:
             if data and not self._frame_done:
+                if not self._started:
+                    self._started = True
+                    # zstandard cannot bound the output of one call, so refuse a frame
+                    # that does not declare its size, or declares more than allowed,
+                    # before decompressing anything (bounded memory on damaged data).
+                    try:
+                        declared = _zs.frame_content_size(bytes(data[:18]))
+                    except _zs.ZstdError:
+                        declared = -1
+                    if declared < 0:
+                        raise ZstdError("the zstd frame does not declare its content size")
+                    if declared > max(max_length, FALLBACK_BUFFER_MAX):
+                        raise ZstdError(f"the zstd frame declares {declared} bytes, more than this decompressor buffers")
                 self._pending += self._d.decompress(data)
                 if self._d.eof:
                     self._frame_done = True
