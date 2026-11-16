@@ -45,7 +45,7 @@ gives them one small, tested primitive instead:
 
 Requires Python 3.12 or newer. The only runtime dependency is zstd: the
 standard library's `compression.zstd` on Python 3.14+, the `backports.zstd`
-package on older versions. (If neither is available, mybucket also works
+package on older versions. (If neither is available, `mybucket` also works
 with the `zstandard` package.)
 
 ```sh
@@ -178,14 +178,14 @@ look like `type/subtype`.
   independent 1 MiB zstd frames, each with its own SHA-256, so a range read
   decompresses and checks only the frames it touches, and a stream of such
   an object never hands out a byte before its frame was checked. A range of
-  a smaller object (or of a large object written by mybucket 0.1) reads and
+  a smaller object (or of a large object written by `mybucket` 0.1) reads and
   checks the whole object.
 
 ### Repairing damage
 
 `verify()` (or `mybucket verify`) re-reads and re-hashes everything. If an
 object is damaged and you still have the original bytes, put them again
-(under the same or any other key), or import a good export again: mybucket
+(under the same or any other key), or import a good export again: `mybucket`
 re-checks the stored copy whenever a write brings content it already has,
 and replaces a damaged copy with the new, hash-checked bytes
 (`info.repaired` is True). Otherwise restore the bucket from a snapshot.
@@ -242,10 +242,10 @@ A remote store has the same API and errors as a local one, except that
 maintenance (`gc`, `verify`, `snapshot`, `export`, `import`, deleting
 buckets, dictionaries, `configure`) raises NotAvailable: run those on the
 machine that holds the store. There is no network listener. The client runs
-`ssh -T -x -a -o ClearAllForwardings=yes -- HOST mybucket serve --stdio
+`ssh -T -x -a -o ClearAllForwardings=yes -- HOST `mybucket` serve --stdio
 --store PATH --write-all|--read-all ...` as a list of arguments (no shell
 string), which speaks a small length-prefixed protocol over stdin/stdout.
-mybucket must be installed on the remote machine (set
+`mybucket` must be installed on the remote machine (set
 `MYBUCKET_REMOTE_COMMAND` if it is not on the remote `PATH`, and
 `MYBUCKET_SSH` to use another ssh). The remote path may only contain
 `A-Z a-z 0-9 . _ / + @ , = -` (optionally starting with `~/`), because ssh
@@ -456,8 +456,8 @@ SQLite keeps a shared-memory file next to a WAL-mode database.
 ## Space
 
 Measured with `uv run python bench/bench_space.py` (defaults) on an Apple
-M1 Pro laptop (macOS, APFS, Python 3.12.8, backports.zstd), with mybucket 0.2. The archive is
-synthetic and highly repetitive JSON, the kind of data mybucket is built for
+M1 Pro laptop (macOS, APFS, Python 3.12.8, backports.zstd), with `mybucket` 0.2. The archive is
+synthetic and highly repetitive JSON, the kind of data `mybucket` is built for
 ([bench/README.md](bench/README.md) describes it):
 
 ```
@@ -555,10 +555,10 @@ Tested on Python 3.12, 3.13 and 3.14 (3.14 with the standard library's
 
 ### Upgrading from 0.1
 
-mybucket 0.2 reads 0.1 stores as they are. The first time it opens a bucket
+`mybucket` 0.2 reads 0.1 stores as they are. The first time it opens a bucket
 for writing, it upgrades it to format 2 in one transaction that only adds
 two tables (nothing is rewritten); read-only opens never change it. After
-that mybucket 0.1 refuses the bucket, so upgrade every machine that writes
+that `mybucket` 0.1 refuses the bucket, so upgrade every machine that writes
 to it (and take a snapshot first if you may need to go back). See
 [docs/FORMAT.md](docs/FORMAT.md#6-upgrading-from-format-1).
 
