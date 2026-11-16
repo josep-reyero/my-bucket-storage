@@ -454,11 +454,11 @@ def test_import_reports_skipped_entries(ready, tmp_path):
     src = tmp_path / "src"
     src.mkdir()
     (src / "ok.txt").write_bytes(b"ok")
-    (src / "bad name.txt").write_bytes(b"no")
+    (src / "bad name.txt ").write_bytes(b"no")  # a trailing space cannot be a key
     # Skipped files make the import exit 1 (so scripts notice), with the list on stderr.
     proc = ready.run("import", "pics", str(src))
     assert proc.returncode == 1
-    assert b"WARNING: skipped 1 entry" in proc.stdout and b"skipped bad name.txt" in proc.stderr
+    assert b"WARNING: skipped 1 entry" in proc.stdout and b"skipped bad name.txt :" in proc.stderr
     assert b"--allow-skips" in proc.stderr
     doc = ready.json("import", "pics", str(src), code=1)
     assert doc["skipped"] == 1 and doc["unchanged"] == 1 and error_of(doc)["code"] == "files_skipped"

@@ -14,7 +14,7 @@ Each class also has an ``exit_code`` that the CLI uses directly:
 1     error (damaged data, unsupported format, other failures)
 2     usage (invalid key, bucket name, argument)
 3     not found (bucket, object, version)
-4     not allowed (read-only store)
+4     not allowed (read-only store, access profile)
 5     refused for safety (precondition failed, bucket not empty,
       already exists)
 75    temporary (the bucket is locked by another writer; retry)
@@ -73,8 +73,9 @@ class InvalidArgument(MyBucketError, ValueError):
 class InvalidKey(InvalidArgument):
     code = "invalid_key"
     default_hint = (
-        "Keys are 1-512 ASCII bytes made of '/'-separated segments; each segment is "
-        "1-255 characters from A-Z a-z 0-9 . _ ~ @ + = , - and must not start with '.'."
+        "Keys are 1-512 bytes of UTF-8 text made of '/'-separated segments. A segment must "
+        "not be empty, start with '.', or start or end with a space; control characters "
+        "and backslashes are not allowed."
     )
 
 
@@ -199,7 +200,34 @@ class PermissionDenied(MyBucketError):
     default_hint = "Check that your user may read and write the store directory and its files."
 
 
+class AccessDenied(PermissionDenied):
+    """The access profile of a remote connection does not allow this (server-side check)."""
+
+    code = "access_denied"
+    default_hint = (
+        "This connection's access profile does not allow it. Ask the owner of the store for "
+        "a profile that includes it."
+    )
+
+
 # -- generic errors (1) ------------------------------------------------------
+
+
+class NotAvailable(MyBucketError):
+    """The operation exists, but not in this situation (for example on a remote store)."""
+
+    code = "not_available"
+    default_hint = "Run it on the machine that holds the store."
+
+
+class ProtocolError(MyBucketError):
+    """The other side of a ``mybucket serve`` connection broke the protocol or went away."""
+
+    code = "protocol_error"
+    default_hint = (
+        "Check that both machines run the same mybucket version, then retry. Nothing that was "
+        "not confirmed was written."
+    )
 
 
 class DamagedError(MyBucketError):
@@ -266,8 +294,11 @@ __all__ = [
     "NotAStore",
     "Busy",
     "PermissionDenied",
+    "AccessDenied",
     "DamagedError",
     "UnsupportedFormat",
     "StoreError",
     "DiskFull",
+    "NotAvailable",
+    "ProtocolError",
 ]

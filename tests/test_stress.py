@@ -40,7 +40,7 @@ try:
     from mybucket import maintenance
 except ImportError:  # built by another part of the project; tests using it skip
     maintenance = None
-from mybucket.codec import CODEC_RAW, CODEC_ZSTD, INLINE_MAX, SMALL_MAX, check_blob
+from mybucket.codec import CODEC_FRAMES, CODEC_RAW, CODEC_ZSTD, INLINE_MAX, SMALL_MAX
 from mybucket.errors import (
     Busy,
     MyBucketError,
@@ -546,7 +546,7 @@ class Harness:
             assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
             rows = list(self.bucket._blob_rows(conn))
         for row in rows:
-            assert check_blob(self.bucket.path, row) is None
+            assert self.bucket._check_blob(row) is None
 
     def reopen(self) -> None:
         self.store.close()
@@ -735,10 +735,10 @@ PLACEMENT = {
     "rand_small_max": (CODEC_RAW, True),
     "rand_small_max_plus_1": (CODEC_RAW, True),
     "json_small_max": (CODEC_ZSTD, True),
-    "json_small_max_plus_1": (CODEC_ZSTD, True),
+    "json_small_max_plus_1": (CODEC_FRAMES, True),
     "repeat_small_max": (CODEC_ZSTD, False),
-    "repeat_small_max_plus_1": (CODEC_ZSTD, False),
-    "hex_small_max_plus_1": (CODEC_ZSTD, True),
+    "repeat_small_max_plus_1": (CODEC_FRAMES, False),
+    "hex_small_max_plus_1": (CODEC_FRAMES, True),
 }
 
 
@@ -1026,7 +1026,7 @@ def test_concurrent_processes_mixed_workload(store, store_path, tmp_path):
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         rows = list(b._blob_rows(conn))
-    assert all(check_blob(b.path, row) is None for row in rows)
+    assert all(b._check_blob(row) is None for row in rows)
     for dest in snapshots:
         with open_store(dest, readonly=True) as snap:
             sb = snap.bucket("shared")
@@ -1191,7 +1191,7 @@ def test_gc_never_removes_a_blob_a_writer_references(store, store_path):
     assert runs > 0 and removed > 0, (runs, removed)
     with b._locked_conn() as conn:
         rows = list(b._blob_rows(conn))
-    assert all(check_blob(b.path, row) is None for row in rows)
+    assert all(b._check_blob(row) is None for row in rows)
     assert maintenance.verify(b)["ok"]
     print(f"gc runs={runs} blobs removed={removed}")
 

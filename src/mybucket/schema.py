@@ -4,17 +4,28 @@ One bucket = one SQLite file (``bucket.sqlite``) in WAL mode. docs/FORMAT.md
 describes the same schema for people reading the data with the sqlite3 CLI;
 keep the two in sync.
 
-Tables (format 1):
+Tables (format 2; format 1 is the same without ``dicts`` and ``frames``):
 
 ``meta(k, v)``
-    format (=1), created_at (unix ms), trash_days, last_version.
+    format (=2), created_at (unix ms), trash_days, last_version, and
+    active_dict (the dictionary new small objects are compressed with; absent
+    when there is none).
 ``blobs(id, hash, size, stored_size, codec, dict_id, data, created_at)``
     One row per distinct content (dedup unit). ``hash`` is the 32-byte SHA-256
-    of the uncompressed bytes (the ETag). ``codec`` 0 = raw, 1 = zstd.
-    ``dict_id`` is reserved for trained dictionaries and is NULL in format 1;
-    readers must refuse a non-NULL value. ``data`` holds the stored bytes
-    when the blob is inline (stored size <= 128 KiB); NULL means the stored
-    bytes are the file ``blobs/<hex[0:2]>/<hex[2:4]>/<hex>``.
+    of the uncompressed bytes (the ETag). ``codec`` 0 = raw, 1 = one zstd
+    frame, 2 = zstd frames with a seek table (see ``frames``). ``dict_id`` is
+    the ``dicts.id`` the zstd data was compressed with, or NULL. ``data``
+    holds the stored bytes when the blob is inline (stored size <= 128 KiB);
+    NULL means the stored bytes are the file
+    ``blobs/<hex[0:2]>/<hex[2:4]>/<hex>``.
+``dicts(id, hash, zstd_id, data, created_at, samples, prefix)``
+    Trained zstd dictionaries (``data`` is what ``zstd -D`` reads). Rows are
+    never changed; gc removes a dictionary once it is neither active nor used.
+``frames(blob_id, start, size, stored_start, stored_size, hash)``
+    The independently readable pieces of a large blob, for verified range
+    reads: content bytes ``[start, start + size)`` are stored bytes
+    ``[stored_start, stored_start + stored_size)`` (one zstd frame for codec 2,
+    the same bytes for codec 0), and ``hash`` is their SHA-256.
 ``objects(key, version, blob_id, content_type, meta, modified)``
     The current version of every key.
 ``trash(key, version, blob_id, content_type, meta, modified, trashed_at, expires_at, reason)``
@@ -31,6 +42,12 @@ Unreferenced blobs are exactly::
     WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.blob_id = b.id)
       AND NOT EXISTS (SELECT 1 FROM trash t WHERE t.blob_id = b.id)
 
+Format 1 buckets (written by mybucket 0.1) are read as they are. Opening one
+for writing upgrades it to format 2 in one transaction (``upgrade_db``): the
+two tables are added and ``format`` / ``user_version`` become 2. Nothing
+else changes, so every format 1 object reads back exactly as before; an
+older mybucket then refuses the bucket instead of misreading it.
+
 Internal for siblings:
     FORMAT_VERSION, APPLICATION_ID, DB_NAME
     connect(path, readonly=False, timeout=10.0) -> sqlite3.Connection
@@ -38,6 +55,8 @@ Internal for siblings:
         callers issue BEGIN IMMEDIATE / COMMIT themselves.
     create_db(path, trash_days) -> None    new bucket database (file mode 0600)
     check_db(conn) -> dict                  validates format; returns meta table
+    upgrade_db(conn) -> bool                format 1 -> 2 (True if it upgraded); takes the write lock
+    has_table(conn, name) -> bool
     translate_sqlite_error(exc, what) -> MyBucketError
     UNREFERENCED_BLOBS_SQL                  the query above
 """
@@ -53,7 +72,7 @@ from pathlib import Path
 
 from .errors import Busy, DiskFull, MyBucketError, NotAStore, StoreError, UnsupportedFormat
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 #: PRAGMA application_id of every bucket database: ASCII "mybk".
 APPLICATION_ID = 0x6D79626B
 DB_NAME = "bucket.sqlite"
@@ -99,6 +118,31 @@ CREATE TABLE trash (
 ) WITHOUT ROWID;
 CREATE INDEX trash_blob ON trash(blob_id);
 CREATE INDEX trash_expires ON trash(expires_at);
+"""
+
+#: What format 2 adds to format 1 (also the upgrade script).
+SCHEMA_V2_SQL = """
+CREATE TABLE IF NOT EXISTS dicts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash       BLOB NOT NULL CHECK (length(hash) = 32),
+    zstd_id    INTEGER NOT NULL,
+    data       BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    samples    INTEGER NOT NULL,
+    prefix     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS frames (
+    blob_id      INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
+    start        INTEGER NOT NULL CHECK (start >= 0),
+    size         INTEGER NOT NULL CHECK (size > 0),
+    stored_start INTEGER NOT NULL CHECK (stored_start >= 0),
+    stored_size  INTEGER NOT NULL CHECK (stored_size > 0),
+    hash         BLOB NOT NULL CHECK (length(hash) = 32),
+    PRIMARY KEY (blob_id, start)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS blobs_dict ON blobs(dict_id) WHERE dict_id IS NOT NULL;
 """
 
 UNREFERENCED_BLOBS_SQL = """
@@ -186,7 +230,7 @@ def create_db(path: str | os.PathLike, trash_days: int) -> None:
         conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
         conn.execute(f"PRAGMA user_version = {FORMAT_VERSION}")
         conn.execute("BEGIN IMMEDIATE")
-        for statement in SCHEMA_SQL.split(";"):
+        for statement in (SCHEMA_SQL + SCHEMA_V2_SQL).split(";"):
             if statement.strip():
                 conn.execute(statement)
         now = int(time.time() * 1000)
@@ -217,3 +261,35 @@ def check_db(conn: sqlite3.Connection) -> dict:
     if fmt < 1:
         raise StoreError("The bucket database has no format version.", hint="Restore it from a snapshot or backup.")
     return meta
+
+
+def has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+def upgrade_db(conn: sqlite3.Connection) -> bool:
+    """Upgrade a format 1 bucket database to format 2, in one transaction.
+
+    Idempotent and crash-safe: either everything below is committed or
+    nothing is. Returns True when this call did the upgrade.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            fmt = int(conn.execute("SELECT v FROM meta WHERE k = 'format'").fetchone()[0])
+            if fmt >= FORMAT_VERSION:
+                conn.execute("ROLLBACK")
+                return False
+            for statement in SCHEMA_V2_SQL.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            conn.execute("UPDATE meta SET v = ? WHERE k = 'format'", (FORMAT_VERSION,))
+            conn.execute(f"PRAGMA user_version = {FORMAT_VERSION}")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        raise translate_sqlite_error(exc, "upgrade the bucket database to format 2") from exc
+    return True

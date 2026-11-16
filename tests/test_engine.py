@@ -24,7 +24,7 @@ import mybucket
 from mybucket import _zstd, open_store
 from mybucket import bucket as bucket_mod
 from mybucket.blobs import blob_path, iter_blob_files, iter_tmp_files, tmp_is_stale
-from mybucket.codec import INLINE_MAX, SMALL_MAX, BlobRow, check_blob
+from mybucket.codec import INLINE_MAX, SMALL_MAX, BlobRow
 from mybucket.errors import (
     BucketExists,
     BucketNotEmpty,
@@ -132,7 +132,7 @@ def test_refuses_non_store_directories(tmp_path):
 def test_database_identity_and_pragmas(bucket):
     with bucket._locked_conn() as conn:
         assert conn.execute("PRAGMA application_id").fetchone()[0] == 0x6D79626B
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
@@ -144,7 +144,7 @@ def test_newer_format_is_refused(store, store_path):
     store.create_bucket("future")
     store.close()
     conn = sqlite3.connect(store_path / "buckets/future/bucket.sqlite")
-    conn.execute("UPDATE meta SET v = 2 WHERE k = 'format'")
+    conn.execute("UPDATE meta SET v = 3 WHERE k = 'format'")
     conn.commit()
     conn.close()
     with open_store(store_path) as s, pytest.raises(UnsupportedFormat):
@@ -275,14 +275,14 @@ def test_inline_threshold_is_on_stored_size(bucket):
 
 
 def test_streamed_large_object(bucket):
-    """> 4 MiB through an iterator: level-9 zstd into a blob file, verified on read."""
+    """> 4 MiB through an iterator: level-9 zstd frames (codec 2) into a blob file, verified on read."""
     chunk = text_bytes(1 << 20, seed=1)
     total = 6
     info = bucket.put("stream.ndjson", (chunk for _ in range(total)), content_type="application/x-ndjson")
     expected = chunk * total
     assert info.size == len(expected) and info.etag == sha(expected)
     [(_, size, stored, codec, _, in_file)] = blob_rows(bucket)
-    assert codec == 1 and size == len(expected)
+    assert codec == 2 and size == len(expected)
     assert stored < size / 3
     with bucket.open("stream.ndjson") as f:
         assert f.info.etag == info.etag
@@ -291,7 +291,7 @@ def test_streamed_large_object(bucket):
     # The blob file decompresses with zstd alone.
     if in_file:
         packed = blob_path(bucket.path, info.etag).read_bytes()
-        assert _zstd.Decompressor().decompress(packed) == expected
+        assert _decompress_frames(packed) == expected
 
 
 def test_streamed_incompressible_becomes_raw_file(bucket):
@@ -308,7 +308,7 @@ def test_streamed_incompressible_becomes_raw_file(bucket):
 def test_streamed_highly_compressible_becomes_inline(bucket):
     info = bucket.put("zeros", (b"\0" * (1 << 20) for _ in range(8)))
     [(_, size, stored, codec, _, in_file)] = blob_rows(bucket)
-    assert size == 8 << 20 and codec == 1 and not in_file and stored < 4096
+    assert size == 8 << 20 and codec == 2 and not in_file and stored < 4096
     assert bucket.get("zeros") == b"\0" * (8 << 20)
     assert info.stored_size == stored
 
@@ -408,7 +408,7 @@ def test_put_of_known_content_skips_compression(bucket, monkeypatch):
     bucket.put("a", data)
     calls = []
     real = _zstd.compress
-    monkeypatch.setattr(_zstd, "compress", lambda d, level: calls.append(level) or real(d, level))
+    monkeypatch.setattr(_zstd, "compress", lambda d, level, dictionary=None: calls.append(level) or real(d, level))
     bucket.put("b", data)
     assert calls == []
     bucket.put("c", data + b"!")
@@ -774,9 +774,9 @@ def test_damaged_and_missing_blob_files(bucket):
         bucket.get("k")
     with bucket._locked_conn() as conn:
         row = BlobRow(*conn.execute("SELECT id, hash, size, stored_size, codec, dict_id, data FROM blobs").fetchone())
-    assert check_blob(bucket.path, row) == "its blob file is missing"
+    assert bucket._check_blob(row) == "its blob file is missing"
     path.write_bytes(original)
-    assert check_blob(bucket.path, row) is None
+    assert bucket._check_blob(row) is None
     assert bucket.get("k") == data
 
 
@@ -792,13 +792,13 @@ def test_damaged_zstd_file_is_detected(bucket):
         bucket.get("k")
 
 
-def test_dictionary_blobs_are_refused_clearly(bucket):
-    bucket.put("k", b"hello")
+def test_missing_dictionary_is_reported_as_damage(bucket):
+    bucket.put("k", b"hello" * 100)
     with bucket._locked_conn() as conn:
         conn.execute("UPDATE blobs SET dict_id = 7")
-    with pytest.raises(UnsupportedFormat) as err:
+    with pytest.raises(DamagedError) as err:
         bucket.get("k")
-    assert "dictionary 7" in err.value.message
+    assert "dictionary it was compressed with (7) is missing" in err.value.message
 
 
 # -- read-only mode ---------------------------------------------------------
@@ -1032,7 +1032,7 @@ def test_kill_minus_nine_never_loses_or_corrupts(store, store_path):
     # Every committed file blob is complete.
     with b._locked_conn() as conn:
         rows = [BlobRow(*r) for r in conn.execute("SELECT id, hash, size, stored_size, codec, dict_id, data FROM blobs")]
-    assert all(check_blob(b.path, r) is None for r in rows)
+    assert all(b._check_blob(r) is None for r in rows)
 
 
 # -- reader retry when gc removes a file after the reader's snapshot ----------
@@ -1086,6 +1086,20 @@ def test_error_shape():
 # -- FORMAT.md: data readable with sqlite3 and zstd alone ----------------------
 
 
+def _decompress_frames(stored: bytes) -> bytes:
+    """Every zstd frame in ``stored``, skipping skippable frames (what ``zstd -d`` does)."""
+    out = []
+    while stored:
+        magic = int.from_bytes(stored[:4], "little")
+        if magic & 0xFFFFFFF0 == 0x184D2A50:  # a skippable frame: magic, size, body
+            stored = stored[8 + int.from_bytes(stored[4:8], "little") :]
+            continue
+        d = _zstd.Decompressor()
+        out.append(d.decompress(stored))
+        stored = d.unused_data
+    return b"".join(out)
+
+
 def test_format_readable_with_plain_sqlite_and_zstd(bucket):
     small = text_bytes(4000)
     large = text_bytes(SMALL_MAX + 100, seed=11)
@@ -1101,7 +1115,7 @@ def test_format_readable_with_plain_sqlite_and_zstd(bucket):
         hexd, size, codec, dict_id, data, ctype, meta = conn.execute(q, (key,)).fetchone()
         assert dict_id is None
         stored = data if data is not None else (bucket.path / "blobs" / hexd[:2] / hexd[2:4] / hexd).read_bytes()
-        content = _zstd.Decompressor().decompress(stored) if codec == 1 else stored
+        content = _decompress_frames(stored) if codec in (1, 2) else stored
         assert content == expected and len(content) == size and sha(content) == hexd
     conn.close()
 

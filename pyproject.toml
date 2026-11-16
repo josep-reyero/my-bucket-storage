@@ -1,6 +1,6 @@
 [project]
 name = "my-bucket-storage"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small S3-like object store for your own apps: SQLite plus zstd, no server process, no lock-in."
 readme = "README.md"
 license = "MIT"

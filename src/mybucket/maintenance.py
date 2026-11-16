@@ -86,6 +86,7 @@ snapshot to another disk for a real backup. When hard links are impossible
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -98,9 +99,9 @@ from . import blobs as _blobs
 from . import keys as _keys
 from .bucket import REASON_OVERWRITTEN
 from .codec import CHUNK, check_blob
-from .errors import InvalidArgument, Refused, VersionNotFound
+from .errors import DamagedError, InvalidArgument, Refused, VersionNotFound
 from .models import STATUS_CREATED, STATUS_UNCHANGED, STATUS_UPDATED, PutInfo
-from .schema import DB_NAME, UNREFERENCED_BLOBS_SQL, connect, translate_sqlite_error
+from .schema import DB_NAME, UNREFERENCED_BLOBS_SQL, connect, has_table, translate_sqlite_error
 
 if TYPE_CHECKING:
     from .bucket import Bucket
@@ -204,6 +205,9 @@ def gc(
         for start in range(0, len(ids), _ID_CHUNK):
             part = ids[start : start + _ID_CHUNK]
             conn.execute(f"DELETE FROM blobs WHERE id IN ({','.join('?' * len(part))})", part)
+        dicts_removed = 0
+        if has_table(conn, "dicts"):
+            dicts_removed = conn.execute(f"DELETE FROM dicts WHERE id IN ({UNUSED_DICTS_SQL})").rowcount
     inline_removed = sum(1 for row in garbage if not row[2])
     inline_bytes = sum(row[3] for row in garbage if not row[2])
     dropped_files = {row[1].hex() for row in garbage if row[2]}
@@ -273,7 +277,7 @@ def gc(
         tmp_bytes += size
 
     # 5. Give freed database pages back to the filesystem.
-    pages_freed = _vacuum(bucket) if (trash_expired or garbage) else 0
+    pages_freed = _vacuum(bucket) if (trash_expired or garbage or dicts_removed) else 0
 
     freed = inline_bytes + file_bytes + tmp_bytes
     parts = []
@@ -285,6 +289,8 @@ def gc(
         parts.append(f"removed {_plural(orphans_removed, 'leftover file')} from interrupted writes")
     if tmp_removed:
         parts.append(f"removed {_plural(tmp_removed, 'abandoned temp file')}")
+    if dicts_removed:
+        parts.append(f"removed {_plural(dicts_removed, 'unused dictionary', 'unused dictionaries')}")
     if parts:
         summary = f"Bucket {name!r}: " + ", ".join(parts) + (f"; freed about {_human_bytes(freed)}." if freed else ".")
     else:
@@ -305,6 +311,7 @@ def gc(
         "orphan_files_removed": orphans_removed,
         "orphan_files_kept": orphans_kept,
         "tmp_files_removed": tmp_removed,
+        "dictionaries_removed": dicts_removed,
         "bytes_freed": freed,
         "database_pages_freed": pages_freed,
         "errors": failures,
@@ -426,20 +433,28 @@ def verify(bucket: Bucket) -> dict:
                 )
             unreferenced = conn.execute(f"SELECT count(*) FROM ({UNREFERENCED_BLOBS_SQL})").fetchone()[0]
             blob_ids = [r[0] for r in conn.execute("SELECT id FROM blobs ORDER BY id")]
+            dictionaries, unused_dicts = _check_dicts(bucket, conn, database)
     except sqlite3.Error as exc:
         raise translate_sqlite_error(exc, f"check bucket {name!r}") from exc
 
     damaged: list[dict] = []
     checked = checked_bytes = 0
     for blob_id in blob_ids:
+        problem = None
         try:
             with bucket._locked_conn() as conn:
                 row = bucket._blob_row(conn, blob_id)
+                if row is not None:
+                    try:
+                        frames, dictionary = bucket._read_parts(conn, row)
+                    except DamagedError as exc:  # its dictionary is damaged
+                        problem = exc.message
         except sqlite3.Error as exc:
             raise translate_sqlite_error(exc, f"check bucket {name!r}") from exc
         if row is None:
             continue  # removed by gc since the listing
-        problem = check_blob(bucket.path, row)
+        if problem is None:
+            problem = check_blob(bucket.path, row, frames, dictionary)
         if problem is not None:
             with bucket._locked_conn() as conn:
                 again = bucket._blob_row(conn, blob_id)
@@ -472,7 +487,7 @@ def verify(bucket: Bucket) -> dict:
             stale_tmp += 1
 
     ok = not (damaged or database or missing_content or invalid_keys)
-    clean = ok and not (orphan_files or unexpected or unreferenced or stale_tmp)
+    clean = ok and not (orphan_files or unexpected or unreferenced or stale_tmp or unused_dicts)
     affected = sum(len(d["versions"]) for d in damaged) + len(missing_content)
     if ok:
         summary = (
@@ -487,6 +502,8 @@ def verify(bucket: Bucket) -> dict:
             garbage.append(_plural(unreferenced, "unused stored content", "unused stored contents"))
         if stale_tmp:
             garbage.append(_plural(stale_tmp, "abandoned temp file"))
+        if unused_dicts:
+            garbage.append(_plural(unused_dicts, "unused dictionary", "unused dictionaries"))
         if garbage:
             summary += f" There is garbage that does not affect your data: {', '.join(garbage)}."
             hint = "Run gc to remove it."
@@ -530,9 +547,41 @@ def verify(bucket: Bucket) -> dict:
         "unreferenced_blobs": unreferenced,
         "tmp_files": tmp_files,
         "stale_tmp_files": stale_tmp,
+        "dictionaries": dictionaries,
+        "unused_dictionaries": unused_dicts,
         "summary": summary,
         "hint": hint,
     }
+
+
+def _check_dicts(bucket: Bucket, conn: sqlite3.Connection, database: list[str]) -> tuple[int, int]:
+    """Check the dictionaries (format 2); problems go to ``database``. Returns (count, unused)."""
+    if not has_table(conn, "dicts"):
+        if conn.execute("SELECT 1 FROM blobs WHERE dict_id IS NOT NULL LIMIT 1").fetchone():
+            database.append("some contents name a dictionary, but this format 1 bucket has none")
+        return 0, 0
+    rows = conn.execute("SELECT id, CAST(hash AS BLOB), CAST(data AS BLOB) FROM dicts ORDER BY id").fetchall()
+    for dict_id, digest, data in rows:
+        if not isinstance(data, bytes) or hashlib.sha256(data).digest() != digest:
+            database.append(f"dictionary {dict_id} is damaged (its SHA-256 does not match)")
+    for (dict_id,) in conn.execute(
+        "SELECT DISTINCT b.dict_id FROM blobs b LEFT JOIN dicts d ON d.id = b.dict_id "
+        "WHERE b.dict_id IS NOT NULL AND d.id IS NULL"
+    ):
+        database.append(f"some contents were compressed with dictionary {dict_id}, which is missing")
+    active = conn.execute("SELECT v FROM meta WHERE k = 'active_dict'").fetchone()
+    if active is not None and not conn.execute("SELECT 1 FROM dicts WHERE id = ?", (active[0],)).fetchone():
+        database.append(f"the active dictionary {active[0]} is missing")
+    unused = conn.execute(f"SELECT count(*) FROM ({UNUSED_DICTS_SQL})").fetchone()[0]
+    return len(rows), unused
+
+
+#: Dictionaries gc may delete: not active and not used by any stored content.
+UNUSED_DICTS_SQL = """
+SELECT d.id FROM dicts d
+WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.dict_id = d.id)
+  AND d.id IS NOT (SELECT CAST(v AS INTEGER) FROM meta WHERE k = 'active_dict')
+"""
 
 
 def _scan_blob_dir(bucket: Bucket) -> tuple[list[dict], list[str]]:

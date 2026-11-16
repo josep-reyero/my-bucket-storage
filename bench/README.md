@@ -44,7 +44,11 @@ It also reports:
   cheap) and get throughput over every key, with every read verified;
 - a streaming put and get of one large object (`--stream-mib`) in a separate
   process, with the peak Python heap (tracemalloc) and the growth of the
-  process's peak RSS. This shows that memory does not grow with object size.
+  process's peak RSS. This shows that memory does not grow with object size;
+- dictionaries off and on: the fitness bucket after `train_dictionary()`
+  and gc, and a second dataset of `--records` small JSON records (default
+  20,000) stored once without a dictionary and once with one trained after
+  the first `--train-after` (default 2,000).
 
 Everything is written to a temporary directory and deleted afterwards
 (`--keep DIR` keeps it).
@@ -52,7 +56,7 @@ Everything is written to a temporary directory and deleted afterwards
 ### Results
 
 Run on an Apple M1 Pro laptop (macOS, APFS, Python 3.12.8, backports.zstd)
-with the defaults: `uv run python bench/bench_space.py`. Read the speeds as
+with the defaults and mybucket 0.2: `uv run python bench/bench_space.py`. Read the speeds as
 rough figures.
 
 ```
@@ -68,13 +72,18 @@ Bucket: database / blob files on disk  7.1 MiB / 5.0 MiB  (1,980 inline, 4 file 
 Bucket: distinct contents              1,984 blobs, 40 old versions in trash
 Ratio plain on disk / bucket on disk   4.08x
 Ratio logical / bucket on disk         3.56x
-Put throughput (all puts)              749 puts/s, 11.0 MiB/s (20.5 s)
-  new or changed content               120 puts/s, 2.3 MiB/s (2,359 puts, 19.6 s)
-  unchanged re-puts                    15,120 puts/s, 209.9 MiB/s (12,994 puts, 0.9 s)
-Get throughput (every key)             16,319 gets/s, 302.4 MiB/s (0.1 s)
-Streaming put of 256.0 MiB             48.3 MiB/s, stored as 59.9 MiB
-  peak memory during put               6.2 MiB Python heap, 19.2 MiB process RSS growth
-  streaming get                        539.0 MiB/s, 6.3 MiB Python heap peak
+Put throughput (all puts)              705 puts/s, 10.3 MiB/s (21.8 s)
+  new or changed content               114 puts/s, 2.2 MiB/s (2,359 puts, 20.6 s)
+  unchanged re-puts                    12,073 puts/s, 167.6 MiB/s (12,994 puts, 1.1 s)
+Get throughput (every key)             15,148 gets/s, 280.7 MiB/s (0.2 s)
+Streaming put of 256.0 MiB             53.5 MiB/s, stored as 59.6 MiB
+  peak memory during put               8.2 MiB Python heap, 16.4 MiB process RSS growth
+  streaming get                        447.9 MiB/s, 6.4 MiB Python heap peak
+Fitness bucket with a dictionary       12.1 MiB -> 12.1 MiB on disk; stored bytes 10.4 MiB -> 10.4 MiB (0.0% less)
+  training                             3.4 s incl. recompressing 0 objects; 32.0 KiB dictionary, 1.1% saved on held-out objects
+Small records (20,000, 4.5 MiB)        dictionary off 7.1 MiB on disk (3.4 MiB stored), on 5.1 MiB (1.0 MiB stored)
+  put / get, dictionary off            220 puts/s, 32,570 gets/s
+  put / get, dictionary on             204 puts/s, 37,437 gets/s (trained after 2,000 records in 0.3 s)
 ```
 
 What the numbers say:
@@ -95,7 +104,15 @@ What the numbers say:
   are hashed and compared only, with nothing compressed or written, so a sync
   tool that re-uploads a whole week every day pays almost nothing for it.
   `bucket.batch()` puts several objects under one commit when that matters.
-- **Memory.** A 256 MiB streaming put peaks at about 6 MiB of Python heap,
+- **Dictionaries.** On the fitness archive `train_dictionary()` measured a
+  1.1 % saving on held-out documents and did not keep the dictionary (the
+  threshold is 5 %): documents of 15-40 KB are already large enough for zstd
+  -19. On 20,000 small records (150-400 bytes of JSON each; the first 2,000
+  stored, then a dictionary trained and the existing ones recompressed, then
+  the other 18,000 stored with it) stored bytes went from 3.4 MiB to 1.0 MiB
+  (70 % less) and the bucket on disk from 7.1 MiB to 5.1 MiB; per-row SQLite
+  overhead is most of what remains. Put and get speed hardly change.
+- **Memory.** A 256 MiB streaming put peaks at about 6-8 MiB of Python heap,
   the same as a 64 MiB one (tests/test_stress.py checks that peak memory does
   not grow with size). A streaming get stays near 6 MiB.
 

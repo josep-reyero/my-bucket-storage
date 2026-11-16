@@ -18,11 +18,20 @@ It also measures put and get throughput and the peak memory of one large
 streaming put and streaming get, in a separate process so earlier phases do
 not distort the numbers.
 
+Then it compares trained zstd dictionaries off and on:
+
+- the same fitness bucket after ``train_dictionary()`` (which recompresses
+  the stored small objects) and gc;
+- a second dataset of many small, similar records (one JSON document per
+  workout lap / notification, a few hundred bytes each), stored once without
+  a dictionary and once with one trained after the first 2,000 records.
+
 Usage (from the repository root):
 
     uv run python bench/bench_space.py              # 365 days, 256 MiB stream
     uv run python bench/bench_space.py --days 90 --stream-mib 64
     uv run python bench/bench_space.py --json       # machine-readable result
+    uv run python bench/bench_space.py --records 50000
 
 Everything is written to a temporary directory that is deleted afterwards,
 unless --keep DIR is given.
@@ -212,6 +221,37 @@ def build_archive(days: int, seed: int):
     return ops, final
 
 
+def small_record(i: int, rng: random.Random) -> bytes:
+    """One small JSON document, as a per-lap or per-notification export would write."""
+    kind = rng.choice(["lap", "lap", "lap", "notification", "hr_zone"])
+    start = dt.datetime(2025, 1, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=7 * i)
+    doc: dict = {"id": f"rec-{i:07d}", "type": kind, "start": start.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if kind == "lap":
+        doc |= {
+            "activity": rng.choice(["running", "cycling", "walking"]),
+            "lap": rng.randint(1, 30),
+            "duration_s": rng.randint(120, 900),
+            "distance_m": rng.randint(300, 5000),
+            "avg_hr": rng.randint(110, 175),
+            "max_hr": rng.randint(150, 195),
+            "avg_cadence": rng.randint(70, 95),
+            "elevation_gain_m": rng.randint(0, 80),
+            "calories": rng.randint(20, 200),
+            "device": "generic-watch-2",
+        }
+    elif kind == "notification":
+        doc |= {
+            "app": rng.choice(["calendar", "messages", "weather"]),
+            "title": rng.choice(["Reminder", "New message", "Rain expected"]),
+            "shown_s": rng.randint(1, 10),
+            "dismissed": rng.random() < 0.8,
+            "device": "generic-watch-2",
+        }
+    else:
+        doc |= {"zones_s": [rng.randint(0, 1200) for _ in range(5)], "threshold_hr": 172, "max_hr": 190}
+    return json.dumps(doc, indent=1).encode()
+
+
 # -- disk accounting ----------------------------------------------------------------
 
 
@@ -254,6 +294,77 @@ def zstd_files_estimate(final: dict[str, bytes], block: int) -> int:
         packed = _zstd.compress(data, 19)
         total += max(1, math.ceil(min(len(packed), len(data)) / block)) * block
     return total
+
+
+# -- dictionaries off and on -----------------------------------------------------------------
+
+
+def bucket_disk(store_dir: Path, name: str) -> int:
+    bdir = store_dir / "buckets" / name
+    return disk_usage(bdir)[1]
+
+
+def measure_records(work: Path, n: int, seed: int, train_after: int) -> dict:
+    """Store ``n`` small records without and with a dictionary; sizes and speeds."""
+    rng = random.Random(seed + 101)
+    records = [(f"laps/{i // 1000:03d}/{i:07d}.json", small_record(i, rng)) for i in range(n)]
+    out: dict = {"records": n, "logical_bytes": sum(len(v) for _, v in records), "train_after": train_after}
+    for mode in ("off", "on"):
+        store_dir = work / f"records-{mode}"
+        store = open_store(store_dir)
+        b = store.create_bucket("records")
+        put_s = train_s = 0.0
+        for i, (key, data) in enumerate(records):
+            if mode == "on" and i == train_after:
+                t0 = time.perf_counter()
+                report = b.train_dictionary()
+                train_s = time.perf_counter() - t0
+                out["train_report"] = {k: report[k] for k in ("kept", "dict_bytes", "samples", "saving", "recompressed")}
+            t0 = time.perf_counter()
+            b.put(key, data)
+            put_s += time.perf_counter() - t0
+        t0 = time.perf_counter()
+        for key, data in records:
+            if b.get(key) != data:
+                raise SystemExit(f"read back of {key} differs")
+        get_s = time.perf_counter() - t0
+        st = b.stats()
+        store.close()
+        out[mode] = {
+            "on_disk": bucket_disk(store_dir, "records"),
+            "stored_bytes": st.stored_bytes,
+            "dict_blobs": st.dict_blobs,
+            "put_s": put_s,
+            "get_s": get_s,
+            "train_s": train_s,
+        }
+    return out
+
+
+def measure_fitness_dict(store_dir: Path) -> dict:
+    """Train a dictionary on the fitness bucket (recompressing it), gc, and measure again."""
+    before = bucket_disk(store_dir, "fitness")
+    store = open_store(store_dir)
+    b = store.bucket("fitness")
+    stored_before = b.stats().stored_bytes
+    t0 = time.perf_counter()
+    report = b.train_dictionary()
+    train_s = time.perf_counter() - t0
+    b.gc()
+    st = b.stats()
+    store.close()
+    return {
+        "on_disk_before": before,
+        "on_disk_after": bucket_disk(store_dir, "fitness"),
+        "stored_before": stored_before,
+        "stored_after": st.stored_bytes,
+        "train_s": train_s,
+        "kept": report["kept"],
+        "saving_held_out": report["saving"],
+        "recompressed": report["recompressed"],
+        "dict_bytes": report["dict_bytes"],
+        "dict_blobs": st.dict_blobs,
+    }
 
 
 # -- streaming memory, measured in a child process ---------------------------------------
@@ -394,6 +505,8 @@ def run(args) -> dict:
             check=True,
         )
         stream = json.loads(child.stdout)
+        fitness_dict = measure_fitness_dict(store_dir)
+        records = measure_records(work, args.records, args.seed, args.train_after)
         return {
             "days": args.days,
             "seed": args.seed,
@@ -423,6 +536,8 @@ def run(args) -> dict:
             },
             "get": {"seconds": get_s, "bytes": got, "ops": len(final)},
             "stream": stream,
+            "fitness_dict": fitness_dict,
+            "small_records": records,
             "python": sys.version.split()[0],
             "zstd_backend": _zstd.BACKEND,
         }
@@ -501,6 +616,38 @@ def print_table(r: dict) -> None:
             f"{s['bytes'] / MiB / s['get_s']:,.1f} MiB/s, {human(s['get_peak_python'])} Python heap peak",
         ),
     ]
+    fd = r["fitness_dict"]
+    rows += [
+        (
+            "Fitness bucket with a dictionary",
+            f"{human(fd['on_disk_before'])} -> {human(fd['on_disk_after'])} on disk; stored bytes "
+            f"{human(fd['stored_before'])} -> {human(fd['stored_after'])} "
+            f"({1 - fd['stored_after'] / fd['stored_before']:.1%} less)",
+        ),
+        (
+            "  training",
+            f"{fd['train_s']:.1f} s incl. recompressing {fd['recompressed']:,} objects; "
+            f"{human(fd['dict_bytes'])} dictionary, {fd['saving_held_out']:.1%} saved on held-out objects",
+        ),
+    ]
+    sr = r["small_records"]
+    off, on = sr["off"], sr["on"]
+    rows += [
+        (
+            f"Small records ({sr['records']:,}, {human(sr['logical_bytes'])})",
+            f"dictionary off {human(off['on_disk'])} on disk ({human(off['stored_bytes'])} stored), "
+            f"on {human(on['on_disk'])} ({human(on['stored_bytes'])} stored)",
+        ),
+        (
+            "  put / get, dictionary off",
+            f"{sr['records'] / off['put_s']:,.0f} puts/s, {sr['records'] / off['get_s']:,.0f} gets/s",
+        ),
+        (
+            "  put / get, dictionary on",
+            f"{sr['records'] / on['put_s']:,.0f} puts/s, {sr['records'] / on['get_s']:,.0f} gets/s "
+            f"(trained after {sr['train_after']:,} records in {on['train_s']:.1f} s)",
+        ),
+    ]
     width = max(len(k) for k, _ in rows)
     print(f"mybucket space benchmark (Python {r['python']}, {r['zstd_backend']}, trash_days={r['trash_days']})")
     print("-" * (width + 50))
@@ -519,6 +666,8 @@ def main(argv=None) -> None:
     parser.add_argument("--seed", type=int, default=1, help="random seed (default 1)")
     parser.add_argument("--stream-mib", type=int, default=256, help="size of the streaming put in MiB (default 256)")
     parser.add_argument("--trash-days", type=int, default=7, help="bucket trash_days (default 7, as a new bucket)")
+    parser.add_argument("--records", type=int, default=20000, help="small records for the dictionary test (default 20000)")
+    parser.add_argument("--train-after", type=int, default=2000, help="records stored before training (default 2000)")
     parser.add_argument("--skip-zstd-estimate", action="store_true", help="skip the per-file zstd -19 estimate")
     parser.add_argument("--keep", metavar="DIR", help="write into DIR and keep it, instead of a temp dir")
     parser.add_argument("--json", action="store_true", help="print the result as JSON")

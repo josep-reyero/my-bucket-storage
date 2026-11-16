@@ -40,7 +40,6 @@ from conftest import SRC
 
 from mybucket import open_store
 from mybucket.blobs import iter_blob_files, iter_tmp_files, tmp_is_stale
-from mybucket.codec import check_blob
 from mybucket.errors import ObjectNotFound
 
 try:
@@ -329,7 +328,7 @@ def test_sigkill_at_random_moments(tmp_path):
                 assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
                 rows = list(b._blob_rows(conn))
             for row in rows:
-                problem = check_blob(b.path, row)
+                problem = b._check_blob(row)
                 assert problem is None, f"round {rnd}: blob {row.hash.hex()} is damaged: {problem}"
             row_hashes = {row.hash.hex() for row in rows}
             orphans = {h for h, _ in iter_blob_files(b.path)} - row_hashes

@@ -156,7 +156,7 @@ wheels = [
 
 [[package]]
 name = "my-bucket-storage"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'" },

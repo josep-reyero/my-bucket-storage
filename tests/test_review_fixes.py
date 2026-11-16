@@ -482,12 +482,20 @@ def test_readme_python_examples_run(tmp_path):
     (tmp_path / "video.mp4").write_bytes(os.urandom(6 << 20))
     (tmp_path / "home").mkdir()
     code = "\n\n".join(blocks)
+    from remote_helpers import install_fake_ssh
+
+    install_fake_ssh(tmp_path / "bin")  # the ssh:// example runs against a local "remote"
     proc = subprocess.run(
         [sys.executable, "-c", code],
         cwd=tmp_path,
         capture_output=True,
         text=True,
-        env={**os.environ, "PYTHONPATH": str(SRC), "HOME": str(tmp_path / "home")},
+        env={
+            **os.environ,
+            "PYTHONPATH": str(SRC),
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}",
+        },
         timeout=120,
     )
     assert proc.returncode == 0, proc.stderr

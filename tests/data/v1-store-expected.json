@@ -1,0 +1,55 @@
+{
+ "archive": {
+  "days/2026-11-14.json": {
+   "content_type": "application/json",
+   "etag": "550c33e54b8bb8ec140772a7899afaf567a8c3cd1029d18967346115918ca0c4",
+   "meta": "{\"source\":\"example\"}",
+   "size": 1292,
+   "version": 2
+  },
+  "days/2026-11-15.json": {
+   "content_type": "application/json",
+   "etag": "74dbc32593d8f7ca3e1ce27a843b57d23b8b62f5022fccfa768ae764e4e607be",
+   "meta": null,
+   "size": 1293,
+   "version": 3
+  },
+  "empty": {
+   "content_type": null,
+   "etag": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "meta": null,
+   "size": 0,
+   "version": 4
+  },
+  "logs/big.ndjson": {
+   "content_type": null,
+   "etag": "74c5d99f14f0a1f8adc8ee21da38c097528b59fc96e57c298a8d0f271e6d5a08",
+   "meta": null,
+   "size": 4194414,
+   "version": 7
+  },
+  "raw/noise.bin": {
+   "content_type": null,
+   "etag": "99ff7de4a22decac43bd7ee538b3cb70e621cf981a3a8fb1f66c0e41ea3bd714",
+   "meta": null,
+   "size": 1000,
+   "version": 5
+  },
+  "raw/photo.jpg": {
+   "content_type": "image/jpeg",
+   "etag": "74cd1bb9ab3ef92258d222248367480dc4689ad9ec1e55c173516af6eca40370",
+   "meta": null,
+   "size": 140000,
+   "version": 6
+  }
+ },
+ "second": {
+  "a/b/c.txt": {
+   "content_type": null,
+   "etag": "a9f9ece89e9688072c12f41c75bdc13955141288c8cb24036c16ffc3857ff574",
+   "meta": null,
+   "size": 19,
+   "version": 1
+  }
+ }
+}

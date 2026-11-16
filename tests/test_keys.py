@@ -22,6 +22,21 @@ VALID_KEYS = [
     "a..b",
     "a/b.",
     "a/b/c.d.e",
+    # Allowed since format 2: spaces inside a segment, any printable text, UTF-8.
+    "IMG 1234.jpg",
+    "photos/2026/summer trip/IMG 1234.jpg",
+    "café.txt",
+    "日本語/ファイル.txt",
+    "emoji/👨‍👩‍👧 family.png",  # zero-width joiners are part of the emoji
+    "a?b",
+    "a#b",
+    "a%2Fb",
+    "a*b",
+    "a:b",
+    "a|b",
+    "quotes ' and \"",
+    "-starts-with-dash",
+    "é" * 127,  # 254 bytes in UTF-8
 ]
 
 INVALID_KEYS = [
@@ -35,18 +50,31 @@ INVALID_KEYS = [
     "a/../b",
     ".hidden",
     "a/.state/token",
-    "a b",
+    " leading",
+    "trailing ",
+    "a/ b",
+    "a /b",
+    "a/\u00a0nbsp",
+    "a\u3000",
     "a\\b",
+    "..\\..\\x",
     "a\x00b",
-    "café",
-    "a?b",
-    "a#b",
-    "a%2Fb",
-    "a*b",
-    "a:b",
+    "a\nb",
+    "a\tb",
+    "a\x7fb",
+    "a\x85b",
+    "x\u202ey",  # right-to-left override: makes names look like something else
+    "x\u2066y",
+    "x\u200ey",
+    "x\u200by",
+    "x\u2028y",
+    "x\ufeffy",
+    "x\ud800y",  # lone surrogate (from undecodable bytes)
     "A" * 256,
+    "é" * 128,  # 256 bytes in UTF-8
     "/".join(["a" * 200] * 3),  # 602 bytes
     "a" * 513,
+    "/".join(["é" * 100] * 3),  # 602 bytes in UTF-8, 302 characters
 ]
 
 
@@ -77,31 +105,64 @@ def test_key_of_exactly_512_bytes():
     keys.validate_key(key)
     with pytest.raises(InvalidKey):
         keys.validate_key(key + "c")
+    utf8 = "/".join(["é" * 127, "ü" * 127])  # 254 + 1 + 254 = 509 bytes
+    assert keys.validate_key(utf8 + "/ab") == utf8 + "/ab"
+    with pytest.raises(InvalidKey):
+        keys.validate_key(utf8 + "/abc")
 
 
-_segment = st.text(alphabet=sorted(keys.SEGMENT_CHARS), min_size=1, max_size=20)
-_any_text = st.text(alphabet=string.printable + "é☃", max_size=40)
+def test_keys_are_nfc_normalised():
+    decomposed = "cafe\u0301/man\u0303a.txt"  # how macOS used to spell names on disk
+    assert keys.validate_key(decomposed) == "café/maña.txt"
+    assert not keys.is_valid_key(decomposed)  # valid input, but not the stored form
+    assert keys.is_valid_key("café/maña.txt")
+    assert keys.validate_prefix("cafe\u0301") == "café"
+    # Compatibility characters are kept: NFC, not NFKC.
+    assert keys.validate_key("ﬁle") == "ﬁle"
+
+
+def test_normalisation_cannot_smuggle_a_forbidden_segment():
+    # U+2024 ONE DOT LEADER is not a dot under NFC, so it is an ordinary character...
+    assert keys.validate_key("\u2024\u2024/x") == "\u2024\u2024/x"
+    # ...and a combining mark after a dot never turns the dot into a non-dot.
+    with pytest.raises(InvalidKey):
+        keys.validate_key(".\u0301/x")
+
+
+def test_bucket_like_segment_error_messages_are_plain():
+    with pytest.raises(InvalidKey) as err:
+        keys.validate_key("a\u202eb")
+    assert "U+202E" in err.value.message and "right-to-left override" in err.value.message
+    with pytest.raises(InvalidKey) as err:
+        keys.validate_key("x/ y")
+    assert "starts or ends with a space" in err.value.message
+
+
+_any_text = st.text(alphabet=st.characters(codec="utf-8") | st.sampled_from("/. \\é\u0301\x00\u202e"), max_size=40)
 
 
 @given(st.lists(_any_text, min_size=1, max_size=6).map("/".join))
 def test_valid_keys_are_always_safe_relative_paths(candidate):
     """Whatever the input, a key that passes validation can never escape a directory."""
-    if not keys.is_valid_key(candidate):
+    try:
+        key = keys.validate_key(candidate)
+    except InvalidKey:
         return
-    assert not candidate.startswith("/")
-    normalized = posixpath.normpath(candidate)
-    assert normalized == candidate
-    parts = candidate.split("/")
+    assert keys.is_valid_key(key)
+    assert not key.startswith("/")
+    assert posixpath.normpath(key) == key
+    parts = key.split("/")
     assert ".." not in parts and "." not in parts
-    assert all(not p.startswith(".") for p in parts)
-    assert candidate.isascii()
-    assert "\\" not in candidate and "\x00" not in candidate
+    assert all(p and not p.startswith(".") and p == p.strip() for p in parts)
+    assert "\\" not in key and "\x00" not in key
+    assert not any(ord(c) < 0x20 or 0x7F <= ord(c) < 0xA0 for c in key)
+    assert len(key.encode("utf-8")) <= 512
 
 
-@given(st.lists(_segment, min_size=1, max_size=5))
+@given(st.lists(st.text(alphabet=string.ascii_letters + string.digits + "._~@+=,- ", min_size=1, max_size=20), min_size=1, max_size=5))
 def test_generated_keys_round_trip(segments):
     key = "/".join(segments)
-    if any(s.startswith(".") for s in segments) or len(key) > 512:
+    if any(s.startswith(".") or s != s.strip() for s in segments) or len(key) > 512:
         with pytest.raises(InvalidKey):
             keys.validate_key(key)
     else:
@@ -127,7 +188,10 @@ def test_prefixes():
     assert keys.validate_prefix(None) == ""
     assert keys.validate_prefix("a/b/") == "a/b/"
     assert keys.validate_prefix("a/b/pa") == "a/b/pa"
-    for bad in ["a b", "café", "a" * 513, 3]:
+    assert keys.validate_prefix("a b") == "a b"
+    assert keys.validate_prefix("my ") == "my "  # may end anywhere, even after a space
+    assert keys.validate_prefix("café") == "café"
+    for bad in ["a\x00", "a\\b", "x\u202e", "a" * 513, "é" * 257, 3]:
         with pytest.raises(InvalidKey):
             keys.validate_prefix(bad)
 

@@ -14,7 +14,8 @@ serialises writers per bucket (busy timeout plus ``BEGIN IMMEDIATE``) and
 lets any number of readers work alongside one writer.
 
 Public:
-    open_store(path, readonly=False, create=True, timeout=10.0) -> Store
+    open_store(path, readonly=False, create=True, timeout=10.0, remote_command=None) -> Store
+                                          (a RemoteStore for ssh:// paths)
     Store.bucket(name, create=False) -> Bucket
     Store.create_bucket(name, trash_days=7) -> Bucket
     Store.list_buckets() -> list[str]
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -59,6 +61,8 @@ from .errors import (
     UnsupportedFormat,
 )
 from .schema import DB_NAME, create_db, translate_sqlite_error
+
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 
 STORE_MARKER = "mybucket-store.json"
 BUCKETS_DIR = "buckets"
@@ -84,13 +88,32 @@ def open_store(
     create: bool = True,
     timeout: float = 10.0,
     clock: Callable[[], int] | None = None,
+    remote_command: list[str] | None = None,
 ) -> Store:
     """Open (and, unless ``readonly`` or ``create=False``, create) the store at ``path``.
 
     ``readonly=True`` opens every bucket database with SQLite's read-only
     mode and refuses all writes. ``timeout`` is how many seconds a writer waits
     for another writer before raising Busy. ``clock`` (unix ms) is for tests.
+
+    ``path`` may also be ``ssh://[user@]host[:port]/path`` (``/~/path`` for a
+    path in the remote home): the store on that machine is then used through
+    ``ssh host mybucket serve --stdio`` (see mybucket.remote), with the same
+    API for data; ``remote_command`` replaces ``mybucket`` on that side.
     """
+    if isinstance(path, str) and path.startswith("ssh://"):
+        if clock is not None:
+            raise InvalidArgument("clock cannot be set for a remote store.")
+        from .remote import open_remote
+
+        return open_remote(path, readonly=readonly, create=create, timeout=timeout, remote_command=remote_command)
+    if isinstance(path, str) and _URL_RE.match(path):
+        raise InvalidArgument(
+            f"{path!r} looks like an address, but only ssh:// addresses are supported.",
+            hint="Use ssh://HOST/path for a store on another machine, or a plain path for a local one.",
+        )
+    if remote_command is not None:
+        raise InvalidArgument("remote_command is only for ssh:// stores.")
     return Store(path, readonly=readonly, create=create, timeout=timeout, clock=clock)
 
 

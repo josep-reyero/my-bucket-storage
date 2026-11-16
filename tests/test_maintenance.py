@@ -783,11 +783,11 @@ def test_verify_skips_content_gc_removes_meanwhile(store, store_path, monkeypatc
     real = maintenance.check_blob
     calls = {"n": 0}
 
-    def check_then_collect(path, row):
+    def check_then_collect(path, row, *parts):
         calls["n"] += 1
         if calls["n"] == 1:
             gc(other, orphan_grace=0)  # collects the row and file verify is looking at
-        return real(path, row)
+        return real(path, row, *parts)
 
     monkeypatch.setattr(maintenance, "check_blob", check_then_collect)
     report = verify(b)

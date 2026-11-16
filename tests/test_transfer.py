@@ -316,15 +316,16 @@ def test_import_skips_what_cannot_be_a_key(bucket, tmp_path):
         {
             "ok.txt": b"ok",
             ".DS_Store": b"junk",
-            "has space.txt": b"x",
+            "has space.txt": b"x",  # fine since format 2
+            "trailing.txt ": b"x",
             ".git/config": b"secret-ish",
-            "bad dir/inner.txt": b"x",
+            "bad dir /inner.txt": b"x",
         },
     )
     result = import_dir(bucket, src)
-    assert bucket.list().keys == ["ok.txt"]
+    assert bucket.list().keys == ["has space.txt", "ok.txt"]
     reasons = {e["path"]: e["reason"] for e in result["skipped_entries"]}
-    assert set(reasons) == {".DS_Store", "has space.txt", ".git/", "bad dir/"}
+    assert set(reasons) == {".DS_Store", "trailing.txt ", ".git/", "bad dir /"}
     assert "everything in it was skipped" in reasons[".git/"]
     assert result["skipped"] == 4
 

@@ -27,11 +27,17 @@ Safety rules:
   ``dest``.
 - A key that is also a folder of other keys (``a`` and ``a/b``) cannot be
   written as both a file and a folder. Letter-case variants (``A.txt`` and
-  ``a.txt``) clash on case-insensitive filesystems such as the macOS
-  default; export tests the destination to find out. These clashes are found
-  before anything is written, and export refuses (ExportConflict) unless
-  ``skip_conflicts=True``, which exports everything else and lists the keys
-  it left out.
+  ``a.txt``, ``É`` and ``é``) clash on case-insensitive filesystems such as
+  the macOS default; export tests the destination to find out, and compares
+  names with a deliberately broad caseless form (``keys.fold_path``). These
+  clashes are found before anything is written, and export refuses
+  (ExportConflict) unless ``skip_conflicts=True``, which exports everything
+  else and lists the keys it left out.
+- Whatever rules the destination filesystem really uses to tell names
+  apart, export never lets two keys end up in one file or one folder: it
+  remembers the file and folder identities (device and inode) it wrote or
+  opened in this run, and a key whose path turns out to be one of them is a
+  conflict, even with ``overwrite=True``.
 - Something already at a key's path is never replaced silently: an
   identical file counts as "unchanged", a different file (or a folder or
   link) is a conflict unless ``overwrite=True`` (files and links are then
@@ -66,8 +72,12 @@ front. Rules:
 
 - Symbolic links inside ``src`` are never followed (and are skipped), nor are special
   files. Names that are not valid key segments (hidden files such as
-  ``.DS_Store``, names with spaces, ...) are skipped with the reason; a
-  folder with such a name is skipped as a whole.
+  ``.DS_Store``, names that start or end with a space, ...) are skipped with
+  the reason; a folder with such a name is skipped as a whole.
+- Names are turned into keys in Unicode NFC form (macOS and some copy tools
+  write decomposed names). Names in one folder that are different on disk
+  but the same key once normalised (possible on Linux filesystems) are all
+  skipped with the reason, instead of one silently replacing the other.
 - Content type and metadata come from the manifest when ``src`` holds one,
   looked up by relative path (so export then import round-trips them, with
   or without a prefix); the manifest itself is never imported; otherwise an existing object
@@ -91,6 +101,7 @@ import os
 import secrets
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 from . import keys as _keys
@@ -183,7 +194,7 @@ def _normalize_import_prefix(prefix: object) -> str:
         )
     stripped = prefix[:-1] if prefix.endswith("/") else prefix
     try:
-        _keys.validate_key(stripped)
+        stripped = _keys.validate_key(stripped)
     except InvalidKey as exc:
         raise InvalidKey(
             f"Import prefix {prefix!r} is not usable: {exc.message}",
@@ -227,6 +238,9 @@ class _Dirs:
         self.root_fd = root_fd
         self._cache: dict[tuple[str, ...], int] = {}
         self.touched: set[tuple[str, ...]] = set()
+        root = os.fstat(root_fd)
+        #: (st_dev, st_ino) of every folder opened -> the key folder it was opened for.
+        self._identity: dict[tuple[int, int], tuple[str, ...]] = {(root.st_dev, root.st_ino): ()}
 
     def open(self, parts: tuple[str, ...]) -> int:
         """Return an fd for root/parts, creating folders. Raises _PathProblem."""
@@ -255,6 +269,14 @@ class _Dirs:
             if stat.S_ISLNK(st.st_mode):
                 raise _PathProblem(f"{where!r} in the destination is a symbolic link, which export never follows") from None
             raise _PathProblem(f"{where!r} in the destination is a file, not a folder") from None
+        st = os.fstat(fd)
+        owner = self._identity.setdefault((st.st_dev, st.st_ino), parts)
+        if owner != parts:
+            os.close(fd)
+            raise _PathProblem(
+                f"the folder {'/'.join(parts)!r} is the same folder on this disk as {'/'.join(owner) or '.'!r} "
+                "(the destination does not tell these names apart)"
+            )
         if len(self._cache) >= 64:
             # Keys arrive sorted, so only folders on the current chain are reused.
             for other in [p for p in self._cache if parts[: len(p)] != p]:
@@ -306,14 +328,14 @@ def _key_conflicts(keys: list[str], case_insensitive: bool) -> dict[str, str]:
     if case_insensitive:
         owners: dict[str, set[str]] = {}
         for path in list(folders) + keys:
-            owners.setdefault(path.lower(), set()).add(path)
+            owners.setdefault(_keys.fold_path(path), set()).add(path)
         for key in keys:
             if key in conflicts:
                 continue
             segments = key.split("/")
             for i in range(1, len(segments) + 1):
                 path = "/".join(segments[:i])
-                clash = owners.get(path.lower(), set()) - {path}
+                clash = owners.get(_keys.fold_path(path), set()) - {path}
                 if clash:
                     other = sorted(clash)[0]
                     conflicts[key] = (
@@ -354,7 +376,16 @@ def _existing_state(dir_fd: int, name: str, size: int, etag: str) -> str:
         os.close(fd)
 
 
-def _write_object(stream, dir_fd: int, name: str, modified_ms: int) -> None:
+def _identity_of(dir_fd: int, name: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _write_object(stream, dir_fd: int, name: str, modified_ms: int) -> tuple[int, int]:
+    """Write the stream to ``name`` (temp file, fsync, rename); returns the new file's identity."""
     tmp = f"{_TMP_PREFIX}{secrets.token_hex(8)}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC, _FILE_MODE, dir_fd=dir_fd)
     try:
@@ -367,6 +398,7 @@ def _write_object(stream, dir_fd: int, name: str, modified_ms: int) -> None:
             fsync_file(fd)
             ns = int(modified_ms) * 1_000_000
             os.utime(fd, ns=(ns, ns))
+            st = os.fstat(fd)
         finally:
             os.close(fd)
         os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
@@ -376,6 +408,7 @@ def _write_object(stream, dir_fd: int, name: str, modified_ms: int) -> None:
         except OSError:
             pass
         raise
+    return st.st_dev, st.st_ino
 
 
 def export_dir(
@@ -447,6 +480,7 @@ def export_dir(
         }
         late_conflicts: list[str] = []
         damaged: list[str] = []
+        files_of_this_run: dict[tuple[int, int], str] = {}  # identity -> the key exported there
 
         def conflict(key: str, reason: str) -> None:
             result["skipped"] += 1
@@ -476,6 +510,16 @@ def export_dir(
                 continue
             with stream:
                 info = stream.info
+                identity = _identity_of(dir_fd, name)
+                if identity is not None and identity in files_of_this_run:
+                    other = files_of_this_run[identity]
+                    conflict(
+                        key,
+                        f"the destination does not tell {key!r} and {other!r} apart, and {other!r} "
+                        "was already exported there",
+                    )
+                    late_conflicts.append(key)
+                    continue
                 try:
                     state = _existing_state(dir_fd, name, info.size, info.etag)
                 except PermissionError as exc:
@@ -484,6 +528,8 @@ def export_dir(
                     continue
                 if state == "same":
                     result["unchanged"] += 1
+                    if identity is not None:
+                        files_of_this_run[identity] = key
                 elif state == "folder" or (state != "missing" and not overwrite):
                     what = {"folder": "a folder", "other": "a link or special file"}.get(state, "a different file")
                     conflict(key, f"the destination already has {what} at {key!r}")
@@ -491,7 +537,7 @@ def export_dir(
                     continue
                 else:
                     try:
-                        _write_object(stream, dir_fd, name, info.modified)
+                        files_of_this_run[_write_object(stream, dir_fd, name, info.modified)] = key
                     except DamagedError:
                         damaged.append(key)
                         continue
@@ -623,8 +669,9 @@ class _Importer:
             self.result["skipped_entries"].append({"path": path, "reason": reason})
 
     def _wanted_attrs(self, rel: str, key: str, current) -> tuple[str | None, dict[str, str] | None]:
-        # Export writes each object at its key path, so manifest keys are relative paths.
-        entry = self.manifest.get(rel)
+        # Export writes each object at its key path, so manifest keys are relative paths
+        # (in NFC form, like every key; the names on disk may have been decomposed since).
+        entry = self.manifest.get(unicodedata.normalize("NFC", rel))
         if entry is not None:
             ctype = entry.get("content_type")
             meta = entry.get("metadata") or None
@@ -637,9 +684,8 @@ class _Importer:
         return (self.guess(key) if self.guess else None), None
 
     def add_file(self, rel: str, dir_fd: int, name: str) -> None:
-        key = self.prefix + rel
         try:
-            _keys.validate_key(key)
+            key = _keys.validate_key(self.prefix + rel)
         except InvalidKey as exc:
             self.skip(rel, exc.message)
             return
@@ -713,6 +759,20 @@ class _Importer:
             batch.__exit__(exc[0] or RuntimeError, exc[1], exc[2])
 
 
+def _same_key_names(names: list[str]) -> dict[str, str]:
+    """Entries of one folder whose names differ on disk but are the same key in NFC form."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        groups.setdefault(unicodedata.normalize("NFC", name), []).append(name)
+    clashes: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) > 1:
+            shown = " and ".join(repr(n) for n in sorted(group))
+            for name in group:
+                clashes[name] = f"the names {shown} are different on disk but the same key in Unicode normal form; rename one"
+    return clashes
+
+
 def import_dir(bucket, src: str | os.PathLike, prefix: str = "", guess_types: bool = True) -> dict:
     """Load every regular file under ``src`` into ``bucket`` (key = prefix + relative path).
 
@@ -745,9 +805,13 @@ def import_dir(bucket, src: str | os.PathLike, prefix: str = "", guess_types: bo
         for dirpath, dirnames, filenames, dir_fd in os.fwalk(walk_root, follow_symlinks=False):
             rel_dir = os.path.relpath(dirpath, walk_root)
             rel_dir = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
+            same_key = _same_key_names(dirnames + filenames)
             keep = []
             for name in sorted(dirnames):
                 rel = rel_dir + name
+                if name in same_key:
+                    importer.skip(rel + "/", same_key[name] + ", so everything in it was skipped")
+                    continue
                 try:
                     st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
                 except OSError as exc:
@@ -770,6 +834,9 @@ def import_dir(bucket, src: str | os.PathLike, prefix: str = "", guess_types: bo
                 if not rel_dir and name == MANIFEST_NAME:
                     continue  # export's own record, never an object
                 rel = rel_dir + name
+                if name in same_key:
+                    importer.skip(rel, same_key[name])
+                    continue
                 try:
                     st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
                 except OSError as exc:

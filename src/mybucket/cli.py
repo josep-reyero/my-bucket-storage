@@ -5,7 +5,8 @@ Usage::
     mybucket [--store PATH] [--json] [--timeout SECONDS] COMMAND ...
 
 The store path comes from ``--store`` or the ``MYBUCKET_STORE`` environment
-variable. ``--json`` (accepted before or after the command) makes stdout
+variable; it may be ``ssh://host/path`` for a store on another machine (data
+commands only; see mybucket.remote). ``--json`` (accepted before or after the command) makes stdout
 carry only JSON: one object per run. Errors are then printed as
 ``{"error": {"code", "message", "hint"}}``; without ``--json`` they go to
 stderr as plain text.
@@ -15,7 +16,10 @@ for safety (for example a failed precondition), 75 temporary (the bucket is
 locked by another writer; retry).
 
 Commands that only read open the store read-only, so they can never change
-it. gc, verify, snapshot and restore call ``mybucket.maintenance``.
+it. gc, verify, snapshot and restore call ``mybucket.maintenance``; ``serve``
+is the serving side of remote access (mybucket.server), ``sync`` copies
+between stores (mybucket.replication), ``dict`` manages trained dictionaries
+(mybucket.dicts).
 
 Public: ``main(argv=None) -> int``.
 """
@@ -46,6 +50,7 @@ from .errors import (
     DamagedError,
     InvalidArgument,
     MyBucketError,
+    NotAvailable,
     NotFound,
     ObjectNotFound,
     PreconditionFailed,
@@ -64,11 +69,6 @@ _LS_PAGE = 1000
 
 class UsageError(InvalidArgument):
     code = "usage"
-
-
-class NotAvailable(MyBucketError):
-    code = "not_available"
-    default_hint = "Install a complete, up-to-date mybucket release, then retry."
 
 
 class FolderNotFound(NotFound):
@@ -208,20 +208,35 @@ class Context:
             print(text, file=sys.stderr)
 
     # store
-    def store_path(self) -> Path:
+    def store_text(self) -> str:
         path = self.store_arg or os.environ.get(ENV_STORE)
         if not path:
             raise UsageError(
                 "No store given.",
                 hint=f"Pass --store PATH or set the {ENV_STORE} environment variable.",
             )
-        return Path(path).expanduser()
+        return path
+
+    @property
+    def remote(self) -> bool:
+        return self.store_text().startswith("ssh://")
+
+    def store_path(self) -> Path:
+        return Path(self.store_text()).expanduser()
+
+    def local_only(self, command: str) -> None:
+        """Maintenance commands work on the machine that holds the store, not over ssh://."""
+        if self.remote:
+            raise NotAvailable(
+                f"'mybucket {command}' works only on a store on this machine, not on {self.store_text()}.",
+                hint="Run it on the machine that holds the store (for example over ssh).",
+            )
 
     def store(self, write: bool = False, create: bool = False) -> Store:
         """The store, read-only unless ``write``; only ``create`` may make a new one."""
         store = self._stores.get(write)
         if store is None:
-            path = self.store_path()
+            path = self.store_text() if self.remote else self.store_path()
             try:
                 store = open_store(path, readonly=not write, create=create, timeout=self.timeout)
             except StoreNotFound as exc:
@@ -250,7 +265,8 @@ def _maintenance(name: str, command: str) -> Callable:
     if func is None:
         raise NotAvailable(
             f"The '{command}' command is not available: this installation of mybucket has no "
-            f"mybucket.maintenance.{name}."
+            f"mybucket.maintenance.{name}.",
+            hint="Install a complete, up-to-date mybucket release, then retry.",
         )
     return func
 
@@ -325,6 +341,7 @@ def cmd_mb(ctx: Context, ns) -> int:
 
 
 def cmd_rb(ctx: Context, ns) -> int:
+    ctx.local_only("rb")
     ctx.store(write=True).delete_bucket(ns.bucket, force=ns.force)
     ctx.emit({"bucket": ns.bucket, "deleted": True}, f"Deleted bucket {ns.bucket!r}.")
     return EXIT_OK
@@ -408,8 +425,17 @@ def _copy_stream(stream, write) -> int:
         total += len(chunk)
 
 
-def _to_stdout(ctx: Context, bucket, key: str) -> None:
-    with bucket.open(key) as stream:
+def _range(ns) -> tuple[int | None, int | None]:
+    start, end = getattr(ns, "start", None), getattr(ns, "end", None)
+    if (start is not None and start < 0) or (end is not None and end < 0):
+        raise UsageError("--start and --end must be byte offsets of 0 or more.")
+    if start is not None and end is not None and end < start:
+        raise UsageError(f"--end ({end}) is before --start ({start}).")
+    return start, end
+
+
+def _to_stdout(ctx: Context, bucket, key: str, start=None, end=None) -> None:
+    with bucket.open(key, start, end) as stream:
         out = sys.stdout.buffer
         try:
             _copy_stream(stream, out.write)
@@ -424,7 +450,7 @@ def cmd_get(ctx: Context, ns) -> int:
                 "With --json, stdout carries only JSON, so get needs a destination file.",
                 hint="Give a file: mybucket --json get BUCKET KEY FILE",
             )
-        _to_stdout(ctx, ctx.bucket(ns.bucket), ns.key)
+        _to_stdout(ctx, ctx.bucket(ns.bucket), ns.key, *_range(ns))
         return EXIT_OK
     from .transfer import inside_store
 
@@ -447,13 +473,13 @@ def cmd_get(ctx: Context, ns) -> int:
             f"Cannot write {dest}: the folder {parent} does not exist.",
             hint=f"Create it first (mkdir -p {shlex.quote(str(parent))}) or choose another destination.",
         )
-    if inside_store(ctx.store_path(), dest):
+    if not ctx.remote and inside_store(ctx.store_path(), dest):
         raise UsageError(
             f"Refusing to write {dest}: it is inside the store, and writing there could damage it.",
             hint="Choose a destination outside the store directory.",
         )
     tmp = parent / f".{dest.name}.mybucket-{secrets.token_hex(4)}.part"
-    with bucket.open(ns.key) as stream:
+    with bucket.open(ns.key, *_range(ns)) as stream:
         info = stream.info
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         try:
@@ -471,7 +497,11 @@ def cmd_get(ctx: Context, ns) -> int:
             raise
     data = info.to_dict()
     data["path"] = str(dest)
-    ctx.emit(data, f"Wrote {info.key} to {dest} ({_human_size(info.size)}).")
+    if stream.start or stream.end != info.size:
+        data["range"] = {"start": stream.start, "end": stream.end}
+        ctx.emit(data, f"Wrote bytes {stream.start}-{stream.end} of {info.key} to {dest} ({_human_size(stream.end - stream.start)}).")
+    else:
+        ctx.emit(data, f"Wrote {info.key} to {dest} ({_human_size(info.size)}).")
     return EXIT_OK
 
 
@@ -481,7 +511,7 @@ def cmd_cat(ctx: Context, ns) -> int:
             "cat writes the raw content to stdout, which cannot be combined with --json.",
             hint="Use 'mybucket --json get BUCKET KEY FILE' or 'mybucket --json head BUCKET KEY'.",
         )
-    _to_stdout(ctx, ctx.bucket(ns.bucket), ns.key)
+    _to_stdout(ctx, ctx.bucket(ns.bucket), ns.key, *_range(ns))
     return EXIT_OK
 
 
@@ -602,9 +632,11 @@ def cmd_versions(ctx: Context, ns) -> int:
 
 
 def cmd_restore(ctx: Context, ns) -> int:
-    restore = _maintenance("restore", "restore")
     bucket = ctx.bucket(ns.bucket, write=True)
-    info = restore(bucket, ns.key, ns.version)
+    if ctx.remote:
+        info = bucket.restore(ns.key, ns.version)
+    else:
+        info = _maintenance("restore", "restore")(bucket, ns.key, ns.version)
     data = _plain(info)
     if isinstance(data, dict) and data.get("status") == "unchanged":
         human = f"Nothing to restore: version {ns.version} of {ns.key} has the same content as the current one."
@@ -619,6 +651,7 @@ def cmd_restore(ctx: Context, ns) -> int:
 def cmd_export(ctx: Context, ns) -> int:
     from .transfer import export_dir
 
+    ctx.local_only("export")
     bucket = ctx.bucket(ns.bucket)
     result = export_dir(bucket, ns.dest, prefix=ns.prefix, overwrite=ns.overwrite, skip_conflicts=ns.skip_conflicts)
     human = (
@@ -641,6 +674,7 @@ def cmd_export(ctx: Context, ns) -> int:
 def cmd_import(ctx: Context, ns) -> int:
     from .transfer import import_dir
 
+    ctx.local_only("import")
     bucket = ctx.bucket(ns.bucket, write=True)
     result = import_dir(bucket, ns.src, prefix=ns.prefix, guess_types=not ns.no_guess_type)
     human = (
@@ -658,8 +692,8 @@ def cmd_import(ctx: Context, ns) -> int:
         error = MyBucketError(
             f"{_plural(skipped, 'file or folder', 'files or folders')} under {result['source']} "
             "were not imported because their names cannot be keys.",
-            hint="Rename them (keys allow A-Z a-z 0-9 . _ ~ @ + = , - and '/', no spaces, no leading '.'), "
-            "or pass --allow-skips if leaving them out is fine.",
+            hint="Rename them (a name must not start with '.', start or end with a space, or contain control "
+            "characters or backslashes), or pass --allow-skips if leaving them out is fine.",
         )
         error.code = "files_skipped"
     code = _emit_with_damage(ctx, result, [human], error, quiet_error=True)
@@ -727,6 +761,7 @@ def _damage_lines(report: dict) -> list[str]:
 
 
 def cmd_gc(ctx: Context, ns) -> int:
+    ctx.local_only("gc")
     gc = _maintenance("gc", "gc")
     store = ctx.store(write=True)
     gc_store = None
@@ -754,6 +789,7 @@ def cmd_gc(ctx: Context, ns) -> int:
 
 
 def cmd_verify(ctx: Context, ns) -> int:
+    ctx.local_only("verify")
     verify = _maintenance("verify", "verify")
     store = ctx.store()
     names = ns.buckets or store.list_buckets()
@@ -788,6 +824,7 @@ def cmd_verify(ctx: Context, ns) -> int:
 
 
 def cmd_snapshot(ctx: Context, ns) -> int:
+    ctx.local_only("snapshot")
     snapshot = _maintenance("snapshot", "snapshot")
     report = _plain(snapshot(ctx.store(write=True), ns.dest))
     data = report if isinstance(report, dict) else {"result": report}
@@ -841,6 +878,96 @@ def cmd_stats(ctx: Context, ns) -> int:
     return EXIT_OK
 
 
+def cmd_serve(ctx: Context, ns) -> int:
+    from .access import Profile
+    from .server import serve_stdio
+
+    if not ns.stdio:
+        raise UsageError(
+            "serve needs --stdio: it talks over its standard input and output (for example as an SSH command).",
+            hint="Write: mybucket serve --stdio --store PATH --read-all",
+        )
+    if ctx.remote:
+        raise UsageError("serve needs a store on this machine, not an ssh:// address.")
+    profile = Profile.parse(read=ns.read, write=ns.write, read_all=ns.read_all, write_all=ns.write_all)
+    path = ctx.store_path()
+    return serve_stdio(path, profile, timeout=ctx.timeout)
+
+
+def _open_any(text: str, write: bool, timeout: float, create: bool = False) -> Store:
+    path = text if text.startswith("ssh://") else Path(text).expanduser()
+    try:
+        return open_store(path, readonly=not write, create=create, timeout=timeout)
+    except StoreNotFound as exc:
+        raise StoreNotFound(exc.message, hint=f"Check the path {text!r}.") from None
+
+
+def cmd_sync(ctx: Context, ns) -> int:
+    from .replication import sync
+
+    src = _open_any(ns.src, write=False, timeout=ctx.timeout)
+    try:
+        dst = _open_any(ns.dst, write=not ns.dry_run, timeout=ctx.timeout, create=not ns.dry_run)
+        try:
+            report = sync(src, dst, buckets=ns.buckets or None, prefix=ns.prefix, delete=ns.delete, dry_run=ns.dry_run)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    lines = []
+    for r in report["buckets"]:
+        made = " (created)" if r["created_bucket"] else ""
+        line = (
+            f"{r['bucket']}{made}: {r['copied']:,} new, {r['updated']:,} changed, {r['unchanged']:,} up to date"
+        )
+        if ns.delete:
+            line += f", {r['deleted']:,} deleted"
+        elif r["extra_in_destination"]:
+            line += f", {r['extra_in_destination']:,} only in the destination"
+        lines.append(line)
+        for item in (r["damaged"] + r["conflicts"])[:20]:
+            lines.append(f"  not copied {item['key']}: {item['reason']}")
+    lines.append(report["summary"])
+    if report["hint"]:
+        lines.append(f"  {report['hint']}")
+    error = None
+    if not report["ok"]:
+        error = MyBucketError(
+            "Some objects were not copied (listed above).",
+            hint="Run verify on the source for damaged objects, and sync again for the others.",
+        )
+        error.code = "sync_incomplete"
+    return _emit_with_damage(ctx, report, lines, error)
+
+
+def cmd_dict(ctx: Context, ns) -> int:
+    ctx.local_only("dict")
+    if ns.dict_command == "list":
+        bucket = ctx.bucket(ns.bucket)
+        infos = bucket.dictionaries()
+        lines = [
+            f"dictionary {d.id}{' (active)' if d.active else ''}: {_human_size(d.size)}, trained "
+            f"{_when(d.created_at)} on {d.samples:,} objects{' under ' + repr(d.prefix) if d.prefix else ''}; "
+            f"{d.blobs:,} stored contents use it ({_human_size(d.stored_bytes)})"
+            for d in infos
+        ]
+        ctx.emit({"bucket": bucket.name, "dictionaries": [d.to_dict() for d in infos]}, lines or None)
+        if not infos:
+            ctx.note(f"Bucket {bucket.name!r} has no dictionary. Train one with: mybucket dict train {bucket.name}")
+        return EXIT_OK
+    bucket = ctx.bucket(ns.bucket, write=True)
+    if ns.dict_command in ("on", "off"):
+        bucket.configure(use_dictionary=ns.dict_command == "on")
+        state = "now compressed with its newest dictionary" if ns.dict_command == "on" else "no longer compressed with a dictionary (stored objects stay readable)"
+        ctx.emit({"bucket": bucket.name, "use_dictionary": ns.dict_command == "on"}, f"New small objects in {bucket.name!r} are {state}.")
+        return EXIT_OK
+    report = bucket.train_dictionary(
+        prefix=ns.prefix, dict_size=ns.dict_size, max_samples=ns.max_samples, recompress=not ns.no_recompress
+    )
+    ctx.emit(report, report["summary"])
+    return EXIT_OK
+
+
 # -- argument parsing ------------------------------------------------------------
 
 
@@ -875,8 +1002,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Exit codes: 0 ok, 1 error (also: verify found damage, import skipped files), "
             "2 usage, 3 not found, 4 not allowed, 5 refused for safety (e.g. a failed "
             "--if-match), 75 temporary (locked by another writer: retry). "
-            "Keys: 1-512 ASCII bytes of '/'-separated segments made of A-Z a-z 0-9 . _ ~ @ + = , - "
-            "(no spaces, no segment starting with '.')."
+            "Keys: 1-512 bytes of UTF-8 text in '/'-separated segments; a segment must not start "
+            "with '.' or start or end with a space, and control characters and backslashes are not allowed. "
+            "A store may be ssh://HOST/path (data commands only)."
         ),
     )
     parser.add_argument("--version", action="version", version=f"mybucket {__version__}")
@@ -935,14 +1063,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-sha256", metavar="HEX", help="refuse to store unless the data has this SHA-256"
     )
 
-    p = add("get", cmd_get, "write an object to a file or stdout")
+    p = add("get", cmd_get, "write an object (or a byte range of it) to a file or stdout")
     p.add_argument("bucket")
     p.add_argument("key")
     p.add_argument("dest", nargs="?", default="-", metavar="FILE", help="destination file or folder; '-' or nothing for stdout")
+    p.add_argument("--start", type=int, metavar="BYTE", help="first byte to write (default 0)")
+    p.add_argument("--end", type=int, metavar="BYTE", help="stop before this byte (default: the end)")
 
-    p = add("cat", cmd_cat, "write an object to stdout")
+    p = add("cat", cmd_cat, "write an object (or a byte range of it) to stdout")
     p.add_argument("bucket")
     p.add_argument("key")
+    p.add_argument("--start", type=int, metavar="BYTE", help="first byte to write (default 0)")
+    p.add_argument("--end", type=int, metavar="BYTE", help="stop before this byte (default: the end)")
 
     p = add("head", cmd_head, "show an object's details")
     p.add_argument("bucket")
@@ -1015,6 +1147,52 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("stats", cmd_stats, "show object counts and space used")
     p.add_argument("buckets", nargs="*", metavar="BUCKET", help="buckets to show (default: all)")
+
+    p = add(
+        "sync",
+        cmd_sync,
+        "copy new and changed objects from one store to another (local paths or ssh://HOST/path); "
+        "incremental, verified, safe to interrupt and run again",
+    )
+    p.add_argument("src", metavar="SRC")
+    p.add_argument("dst", metavar="DST")
+    p.add_argument("-b", "--bucket", dest="buckets", action="append", metavar="BUCKET", help="only this bucket (repeatable; default: all)")
+    p.add_argument("--prefix", default="", help="only keys starting with this")
+    p.add_argument("--delete", action="store_true", help="also delete destination objects the source no longer has (they go to its trash)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="only report what would change")
+
+    p = add(
+        "serve",
+        cmd_serve,
+        "serve the store on stdin/stdout for remote use (the command behind ssh://HOST/path); "
+        "access is limited to the grants given here",
+    )
+    p.add_argument("--stdio", action="store_true", help="talk over stdin and stdout (required)")
+    p.add_argument("--read-all", action="store_true", help="allow reading every bucket")
+    p.add_argument("--write-all", action="store_true", help="allow reading and writing every bucket, and creating buckets")
+    p.add_argument("--read", action="append", metavar="BUCKET[/PREFIX]", help="allow reading this bucket, or only keys under PREFIX (repeatable)")
+    p.add_argument("--write", action="append", metavar="BUCKET[/PREFIX]", help="allow reading and writing this bucket, or only keys under PREFIX (repeatable)")
+
+    p = add("dict", cmd_dict, "train and manage zstd dictionaries (for many small, similar objects)")
+    dsub = p.add_subparsers(dest="dict_command", metavar="ACTION", parser_class=_Parser, required=True)
+    t = dsub.add_parser(
+        "train",
+        parents=[common],
+        help="train a dictionary from a bucket's small objects, use it for new ones and recompress stored ones",
+        description="Train a dictionary from a bucket's small objects, use it for new ones and recompress stored ones.",
+    )
+    t.add_argument("bucket")
+    t.add_argument("--prefix", default="", help="train only on keys starting with this")
+    t.add_argument("--dict-size", type=int, default=32 * 1024, metavar="BYTES", help="dictionary size (default 32768)")
+    t.add_argument("--max-samples", type=int, default=2000, metavar="N", help="objects to train on (default 2000)")
+    t.add_argument("--no-recompress", action="store_true", help="only compress new objects with it")
+    for action, text in (
+        ("list", "list a bucket's dictionaries"),
+        ("off", "stop compressing new objects with a dictionary (stored ones stay readable)"),
+        ("on", "compress new small objects with the newest dictionary again"),
+    ):
+        d = dsub.add_parser(action, parents=[common], help=text, description=text[:1].upper() + text[1:] + ".")
+        d.add_argument("bucket")
     return parser
 
 

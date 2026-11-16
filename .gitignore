@@ -9,3 +9,4 @@ config.toml
 docs/design-draft.md
 .hypothesis/
 .ruff_cache/
+!tests/data/v1-store/buckets/*/bucket.sqlite

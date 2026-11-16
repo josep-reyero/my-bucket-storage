@@ -3,8 +3,9 @@
 Public (``Bucket``):
     put(key, data, content_type=None, metadata=None, if_match=None, if_none_match=None,
         expected_size=None, expected_sha256=None) -> PutInfo
-    get(key) -> bytes
-    open(key) -> ObjectStream            buffered binary stream with ``.info``, ``.verified``
+    get(key, start=None, end=None) -> bytes      the object, or bytes [start, end) of it
+    open(key, start=None, end=None) -> ObjectStream
+                                         buffered binary stream with ``.info``, ``.verified``
     head(key) -> ObjectInfo              raises ObjectNotFound
     exists(key) -> bool
     list(prefix="", delimiter=None, limit=None, start_after=None) -> ListResult
@@ -16,8 +17,13 @@ Public (``Bucket``):
     gc(...), verify()                    see mybucket.maintenance
     export_dir(dest, ...), import_dir(src, ...)   see mybucket.transfer
     stats() -> BucketStats
-    configure(trash_days=None)
-    trash_days (property), name, path, readonly, close()
+    configure(trash_days=None, use_dictionary=None)
+    train_dictionary(prefix="", ...) -> dict     see mybucket.dicts
+    dictionaries() -> list[DictInfo]
+    trash_days (property), name, path, readonly, format, close()
+
+Opening a format 1 bucket (written by mybucket 0.1) for writing upgrades it
+to format 2 first (schema.upgrade_db); read-only handles never change it.
 
 A Bucket handle belongs to one bucket directory. If another process deletes
 the bucket (and perhaps creates a new one with the same name), every later
@@ -68,6 +74,11 @@ Internal for siblings (maintenance and CLI code):
                                                   ``previous`` to trash with ``reason``
     Bucket._blob_rows(conn) -> Iterator[BlobRow]  every blobs row (for verify)
     Bucket._blob_row(conn, blob_id) -> BlobRow | None
+    Bucket._read_parts(conn, row, start=0, end=None) -> (frames, dictionary)
+                                                  what BlobReader / check_blob need for row,
+                                                  from the same snapshot
+    Bucket._load_dict(conn, dict_id) -> LoadedDict | None   (DamagedError when damaged)
+    Bucket._active_dict(conn) -> LoadedDict | None
     REASON_OVERWRITTEN, REASON_DELETED, DAY_MS
 """
 
@@ -84,7 +95,23 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from . import blobs as _blobs
 from . import keys as _keys
-from .codec import BLOB_COLUMNS, CHUNK, BlobReader, BlobRow, Staged, check_blob, stage
+import hashlib
+
+from . import _zstd
+from .codec import (
+    BLOB_COLUMNS,
+    CHUNK,
+    CODEC_FRAMES,
+    CODEC_RAW,
+    FRAME_COLUMNS,
+    BlobReader,
+    BlobRow,
+    Frame,
+    LoadedDict,
+    Staged,
+    check_blob,
+    stage,
+)
 from .errors import (
     BucketNotFound,
     ContentMismatch,
@@ -107,7 +134,7 @@ from .models import (
     PutInfo,
     VersionInfo,
 )
-from .schema import DB_NAME, check_db, connect, translate_sqlite_error
+from .schema import DB_NAME, FORMAT_VERSION, check_db, connect, has_table, translate_sqlite_error, upgrade_db
 
 if TYPE_CHECKING:
     from .store import Store
@@ -177,9 +204,12 @@ class ObjectStream(io.BufferedReader):
     byte matched; use ``get()``, or read to the end, when you need checked data.
     """
 
-    def __init__(self, raw: BlobReader, info: ObjectInfo) -> None:
+    def __init__(self, raw: BlobReader, info: ObjectInfo, start: int = 0, end: int | None = None) -> None:
         super().__init__(raw, buffer_size=CHUNK)
         self.info = info
+        #: The range of the object this stream reads: bytes [start, end).
+        self.start = start
+        self.end = info.size if end is None else end
 
     @property
     def verified(self) -> bool:
@@ -187,9 +217,37 @@ class ObjectStream(io.BufferedReader):
         return bool(getattr(self.raw, "verified", False))
 
 
-def _successor(text: str) -> str:
-    """The smallest string greater than every string starting with ``text``."""
-    return text[:-1] + chr(ord(text[-1]) + 1)
+def _successor(text: str) -> str | None:
+    """The smallest string greater than every string starting with ``text`` (None: there is none).
+
+    Code point order is UTF-8 byte order, which is how SQLite compares the keys.
+    Surrogates are skipped: they cannot be encoded, and no key contains one.
+    """
+    while text:
+        last = ord(text[-1])
+        if last < 0x10FFFF:
+            nxt = last + 1
+            if 0xD800 <= nxt <= 0xDFFF:
+                nxt = 0xE000
+            return text[:-1] + chr(nxt)
+        text = text[:-1]
+    return None
+
+
+def _check_range(start: object, end: object) -> tuple[int, int | None]:
+    for name, value in (("start", start), ("end", end)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise InvalidArgument(
+                f"{name} must be a whole number of bytes >= 0, got {value!r}.",
+                hint="A range is get(key, start, end): bytes from start up to (not including) end.",
+            )
+    first = 0 if start is None else start
+    if end is not None and end < first:
+        raise InvalidArgument(
+            f"The range ends ({end}) before it starts ({first}).",
+            hint="A range is get(key, start, end): bytes from start up to (not including) end.",
+        )
+    return first, end  # type: ignore[return-value]
 
 
 class Bucket:
@@ -203,12 +261,18 @@ class Bucket:
         self.tmp_dir = self.path / _blobs.TMP_DIR
         self._lock = threading.RLock()
         self._local = threading.local()  # per-thread state (the open batch)
+        self._dicts: dict[int, LoadedDict] = {}  # dicts rows never change, so they can be cached
+        self._has_frames: bool | None = None
         self._conn: sqlite3.Connection | None = connect(self.db_path, readonly=readonly, timeout=timeout)
         try:
-            check_db(self._conn)
+            meta = check_db(self._conn)
             self._identity = self._file_identity()
             if self._identity is None or self._is_marked_deleted(self._conn):
                 raise BucketNotFound(f"Bucket {name!r} does not exist in the store at {store.path}.")
+            self.format = int(meta["format"])
+            if not readonly and self.format < FORMAT_VERSION:
+                upgrade_db(self._conn)
+                self.format = FORMAT_VERSION
         except BaseException:
             self._conn.close()
             raise
@@ -359,6 +423,78 @@ class Bucket:
         for row in conn.execute(f"SELECT {BLOB_COLUMNS} FROM blobs ORDER BY id"):
             yield BlobRow(*row)
 
+    def _load_dict(self, conn: sqlite3.Connection, dict_id: int) -> LoadedDict | None:
+        """The dictionary ``dict_id`` (cached), None when it does not exist; DamagedError when damaged."""
+        cached = self._dicts.get(dict_id)
+        if cached is not None:
+            return cached
+        if not self._frames_table(conn):
+            return None
+        # CAST: a damaged row holding TEXT must be reported as damage, not fail to decode.
+        row = conn.execute("SELECT CAST(hash AS BLOB), CAST(data AS BLOB) FROM dicts WHERE id = ?", (dict_id,)).fetchone()
+        if row is None:
+            return None
+        digest, data = row
+        if not isinstance(data, bytes) or hashlib.sha256(data).digest() != digest:
+            raise DamagedError(
+                f"Dictionary {dict_id} of bucket {self.name!r} is damaged, so the objects "
+                "compressed with it cannot be read."
+            )
+        try:
+            loaded = LoadedDict(dict_id, digest, _zstd.Dictionary(data))
+        except (_zstd.ZstdError, ValueError, TypeError) as exc:
+            raise DamagedError(f"Dictionary {dict_id} of bucket {self.name!r} cannot be loaded ({exc}).") from None
+        self._dicts[dict_id] = loaded
+        return loaded
+
+    def _active_dict(self, conn: sqlite3.Connection | None = None) -> LoadedDict | None:
+        """The dictionary new small objects are compressed with, or None."""
+        if conn is None:
+            with self._locked_conn() as locked:
+                return self._active_dict(locked)
+        value = self._meta_value(conn, "active_dict")
+        if value is None:
+            return None
+        try:
+            return self._load_dict(conn, int(value))
+        except DamagedError:
+            return None  # never compress new data with a damaged dictionary; verify reports it
+
+    def _frames_table(self, conn: sqlite3.Connection) -> bool:
+        """True once the bucket has the format 2 tables (frames and dicts)."""
+        if not self._has_frames:  # only "yes" is cached: another process may upgrade the bucket
+            self._has_frames = has_table(conn, "frames")
+        return self._has_frames
+
+    def _read_parts(
+        self, conn: sqlite3.Connection, row: BlobRow, start: int = 0, end: int | None = None
+    ) -> tuple[list[Frame] | None, LoadedDict | None]:
+        """The frames (overlapping [start, end)) and the dictionary needed to read ``row``."""
+        frames = None
+        if (row.codec == CODEC_FRAMES or (row.codec == CODEC_RAW and row.data is None)) and self._frames_table(conn):
+            stop = row.size if end is None else min(end, row.size)
+            if start == 0 and stop == row.size:
+                sql = f"SELECT {FRAME_COLUMNS} FROM frames WHERE blob_id = ? ORDER BY start"
+                params: tuple = (row.id,)
+            else:
+                sql = (
+                    f"SELECT {FRAME_COLUMNS} FROM frames WHERE blob_id = ? AND start < ? AND start >= "
+                    "coalesce((SELECT max(start) FROM frames WHERE blob_id = ? AND start <= ?), 0) ORDER BY start"
+                )
+                params = (row.id, stop, row.id, start)
+            frames = [Frame(*r) for r in conn.execute(sql, params)]
+        dictionary = None if row.dict_id is None else self._load_dict(conn, row.dict_id)
+        return frames, dictionary
+
+    def _check_blob(self, row: BlobRow) -> str | None:
+        """check_blob() with the frames and dictionary of ``row``."""
+        try:
+            with self._locked_conn() as conn:
+                frames, dictionary = self._read_parts(conn, row)
+        except DamagedError as exc:
+            return exc.message
+        return check_blob(self.path, row, frames, dictionary)
+
     def _meta_value(self, conn: sqlite3.Connection, name: str):
         row = conn.execute("SELECT v FROM meta WHERE k = ?", (name,)).fetchone()
         return None if row is None else row[0]
@@ -424,7 +560,8 @@ class Bucket:
                 return self._heal_blob(txn, staged, row[0], bool(row[2]))
             return row[0], row[1]
         staged.heal = False  # nothing to repair: the row is gone, a fresh one is made
-        staged.prepare()  # normally done before the lock; here only if gc raced us
+        staged.prepare(self._active_dict(conn))  # normally done before the lock; here only if gc raced us
+        self._keep_dictionary(conn, staged)
         if staged.inline is not None:
             data: bytes | None = staged.inline
         else:
@@ -435,23 +572,43 @@ class Bucket:
             data = None
         cur = conn.execute(
             "INSERT INTO blobs (hash, size, stored_size, codec, dict_id, data, created_at) "
-            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
-            (staged.hash, staged.size, staged.stored_size, staged.codec, data, txn.now),
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (staged.hash, staged.size, staged.stored_size, staged.codec, staged.dict_id, data, txn.now),
         )
+        self._insert_frames(conn, cur.lastrowid, staged)  # type: ignore[arg-type]
         return cur.lastrowid, staged.stored_size  # type: ignore[return-value]
+
+    def _keep_dictionary(self, conn: sqlite3.Connection, staged: Staged) -> None:
+        """Inside the write lock: if the dictionary staged data used is gone (gc), stop using it."""
+        if staged.dict_id is None:
+            return
+        found = conn.execute("SELECT hash FROM dicts WHERE id = ?", (staged.dict_id,)).fetchone()
+        if found is None or staged._dictionary is None or found[0] != staged._dictionary.hash:
+            staged.drop_dictionary()
+
+    def _insert_frames(self, conn: sqlite3.Connection, blob_id: int, staged: Staged) -> None:
+        if self._frames_table(conn):
+            conn.execute("DELETE FROM frames WHERE blob_id = ?", (blob_id,))
+        if staged.frames:
+            conn.executemany(
+                "INSERT INTO frames (blob_id, start, size, stored_start, stored_size, hash) VALUES (?, ?, ?, ?, ?, ?)",
+                [(blob_id, *f) for f in staged.frames],
+            )
 
     def _heal_blob(self, txn: _Txn, staged: Staged, blob_id: int, in_file: bool) -> tuple[int, int]:
         """Replace the damaged stored bytes of ``blob_id`` by the staged (hash-proven) ones."""
-        staged.prepare()
         conn = txn.conn
+        staged.prepare(self._active_dict(conn))
+        self._keep_dictionary(conn, staged)
         if in_file or staged.tmp is not None:
             tmp = staged.stored_bytes_file()
             try:
                 conn.execute(
-                    "UPDATE blobs SET size = ?, stored_size = ?, codec = ?, dict_id = NULL, data = NULL "
+                    "UPDATE blobs SET size = ?, stored_size = ?, codec = ?, dict_id = ?, data = NULL "
                     "WHERE id = ?",
-                    (staged.size, staged.stored_size, staged.codec, blob_id),
+                    (staged.size, staged.stored_size, staged.codec, staged.dict_id, blob_id),
                 )
+                self._insert_frames(conn, blob_id, staged)
                 # Last step: the file is replaced by bytes with the same content. It is
                 # not listed in txn.installed, so an abort never removes it (the row
                 # keeps its name either way).
@@ -460,9 +617,10 @@ class Bucket:
                 tmp.discard()
         else:
             conn.execute(
-                "UPDATE blobs SET size = ?, stored_size = ?, codec = ?, dict_id = NULL, data = ? WHERE id = ?",
-                (staged.size, staged.stored_size, staged.codec, staged.inline, blob_id),
+                "UPDATE blobs SET size = ?, stored_size = ?, codec = ?, dict_id = ?, data = ? WHERE id = ?",
+                (staged.size, staged.stored_size, staged.codec, staged.dict_id, staged.inline, blob_id),
             )
+            self._insert_frames(conn, blob_id, staged)
         staged.repaired = True
         staged.heal = False
         return blob_id, staged.stored_size  # type: ignore[return-value]
@@ -478,7 +636,7 @@ class Bucket:
     def _stored_copy_damaged(self, digest: bytes) -> bool:
         """True when this content is stored but its stored bytes do not read back exactly."""
         row = self._existing_blob(digest)
-        return row is not None and check_blob(self.path, row) is not None
+        return row is not None and self._check_blob(row) is not None
 
     def _prepare_outside_lock(self, staged: Staged) -> None:
         """Compress new content before taking the lock; re-check content the bucket already has.
@@ -488,10 +646,10 @@ class Bucket:
         """
         row = self._existing_blob(staged.hash)
         if row is None:
-            staged.prepare()
-        elif check_blob(self.path, row) is not None:
+            staged.prepare(self._active_dict())
+        elif self._check_blob(row) is not None:
             staged.heal = True
-            staged.prepare()
+            staged.prepare(self._active_dict())
 
     # -- preconditions -----------------------------------------------------
 
@@ -697,17 +855,40 @@ class Bucket:
 
         return import_dir(self, src, prefix=prefix, guess_types=guess_types)
 
-    def configure(self, trash_days: int | None = None) -> None:
-        """Change bucket settings. ``trash_days``: how long old versions are kept (0 = not kept)."""
-        if trash_days is None:
-            return
-        if isinstance(trash_days, bool) or not isinstance(trash_days, int) or not 0 <= trash_days <= 36500:
-            raise InvalidArgument(
-                f"trash_days must be a whole number of days between 0 and 36500, got {trash_days!r}.",
-                hint="For example configure(trash_days=30); 0 turns the trash off.",
-            )
-        with self._write_txn(f"configure bucket {self.name!r}") as txn:
-            txn.conn.execute("UPDATE meta SET v = ? WHERE k = 'trash_days'", (trash_days,))
+    def configure(self, trash_days: int | None = None, use_dictionary: bool | None = None) -> None:
+        """Change bucket settings.
+
+        ``trash_days``: how long old versions are kept (0 = not kept).
+        ``use_dictionary``: False stops compressing new objects with the
+        trained dictionary (stored objects stay readable); True resumes with
+        the newest one.
+        """
+        if trash_days is not None:
+            if isinstance(trash_days, bool) or not isinstance(trash_days, int) or not 0 <= trash_days <= 36500:
+                raise InvalidArgument(
+                    f"trash_days must be a whole number of days between 0 and 36500, got {trash_days!r}.",
+                    hint="For example configure(trash_days=30); 0 turns the trash off.",
+                )
+            with self._write_txn(f"configure bucket {self.name!r}") as txn:
+                txn.conn.execute("UPDATE meta SET v = ? WHERE k = 'trash_days'", (trash_days,))
+        if use_dictionary is not None:
+            if not isinstance(use_dictionary, bool):
+                raise InvalidArgument(f"use_dictionary must be True or False, got {use_dictionary!r}.")
+            from .dicts import set_dictionary_use
+
+            set_dictionary_use(self, use_dictionary)
+
+    def train_dictionary(self, prefix: str = "", dict_size: int = 32 * 1024, max_samples: int = 2000, recompress: bool = True) -> dict:
+        """Train a zstd dictionary from this bucket's small objects and use it; see mybucket.dicts."""
+        from .dicts import train_dictionary
+
+        return train_dictionary(self, prefix=prefix, dict_size=dict_size, max_samples=max_samples, recompress=recompress)
+
+    def dictionaries(self) -> list:
+        """The trained dictionaries stored in this bucket (list of DictInfo)."""
+        from .dicts import dictionaries
+
+        return dictionaries(self)
 
     @property
     def trash_days(self) -> int:
@@ -716,33 +897,43 @@ class Bucket:
 
     # -- public API: reads -------------------------------------------------
 
-    def _open_reader(self, key: str) -> tuple[ObjectInfo, BlobReader]:
+    def _open_reader(self, key: str, start: int = 0, end: int | None = None) -> tuple[ObjectInfo, BlobReader]:
         key = _keys.validate_key(key)
         for _attempt in range(3):
             try:
-                with self._read_txn() as conn:  # one snapshot for both rows
+                with self._read_txn() as conn:  # one snapshot for the rows, frames and dictionary
                     current = self._current(conn, key)
                     row = None if current is None else self._blob_row(conn, current.blob_id)
+                    frames, dictionary = (None, None) if row is None else self._read_parts(conn, row, start, end)
             except sqlite3.Error as exc:
                 raise translate_sqlite_error(exc, f"read {key!r}") from exc
             if current is None or row is None:
                 raise ObjectNotFound(f"Object {key!r} does not exist in bucket {self.name!r}.")
             try:
-                return current.info(), BlobReader(self.path, row, label=repr(key))
+                reader = BlobReader(self.path, row, repr(key), frames, dictionary, start, end)
+                return current.info(), reader
             except FileNotFoundError:
                 continue  # gc may have removed it after our snapshot; look again
         raise DamagedError(f"Object {key!r} is damaged: its blob file is missing.")
 
-    def get(self, key: str) -> bytes:
-        """Return the whole content of ``key``. Raises ObjectNotFound or DamagedError."""
-        _info, reader = self._open_reader(key)
+    def get(self, key: str, start: int | None = None, end: int | None = None) -> bytes:
+        """Return the content of ``key``, or only bytes ``[start, end)`` of it.
+
+        Like a Python slice: ``end`` is not included, ``end=None`` means up
+        to the end, and a range beyond the end of the object is cut short
+        (``get(key, size + 10)`` is ``b""``). Every byte returned has been
+        checked against its SHA-256. Raises ObjectNotFound or DamagedError.
+        """
+        first, end = _check_range(start, end)
+        _info, reader = self._open_reader(key, first, end)
         with reader:
             return reader.readall()
 
-    def open(self, key: str) -> ObjectStream:
-        """Open ``key`` for streaming reads (use as a context manager)."""
-        info, reader = self._open_reader(key)
-        return ObjectStream(reader, info)
+    def open(self, key: str, start: int | None = None, end: int | None = None) -> ObjectStream:
+        """Open ``key`` (or bytes ``[start, end)`` of it) for streaming reads; use as a context manager."""
+        first, end = _check_range(start, end)
+        info, reader = self._open_reader(key, first, end)
+        return ObjectStream(reader, info, reader._start, reader._end)
 
     def head(self, key: str) -> ObjectInfo:
         """Describe ``key`` without reading its content. Raises ObjectNotFound."""
@@ -922,6 +1113,12 @@ class Bucket:
                     "FROM blobs"
                 ).fetchone()
                 trash_days = int(self._meta_value(conn, "trash_days"))
+                dict_blobs = conn.execute("SELECT count(*) FROM blobs WHERE dict_id IS NOT NULL").fetchone()[0]
+                n_dicts = dict_bytes = 0
+                active = self._meta_value(conn, "active_dict")
+                if self._frames_table(conn):
+                    n_dicts, dict_bytes = conn.execute("SELECT count(*), coalesce(sum(length(data)), 0) FROM dicts").fetchone()
+                fmt = int(self._meta_value(conn, "format"))
         except sqlite3.Error as exc:
             raise translate_sqlite_error(exc, f"read bucket {self.name!r}") from exc
         db_bytes = 0
@@ -944,6 +1141,11 @@ class Bucket:
             database_bytes=db_bytes,
             file_bytes=file_bytes,
             trash_days=trash_days,
+            dict_blobs=dict_blobs,
+            dictionaries=n_dicts,
+            dict_bytes=dict_bytes,
+            active_dict=None if active is None else int(active),
+            format=fmt,
         )
 
 

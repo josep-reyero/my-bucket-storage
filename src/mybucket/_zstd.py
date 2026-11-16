@@ -13,12 +13,17 @@ never touches the engine. tests/test_zstd_shim.py runs the codec against the
 Internal for siblings:
     BACKEND: str                       which implementation was loaded
     ZstdError: exception class         raised on malformed input
-    compress(data, level) -> bytes     one frame, content size in the header
+    Dictionary(content)                a trained zstd dictionary (the bytes ``zstd -D``
+                                       reads): .content, .zstd_id (the ID written in
+                                       every frame compressed with it)
+    train(samples, size) -> bytes      train a dictionary of at most ``size`` bytes
+    compress(data, level, dictionary=None) -> bytes
+                                       one frame, content size in the header
     Compressor(level)                  .compress(chunk) -> bytes, .flush() -> bytes
-    Decompressor()                     .decompress(data, max_length=-1) -> bytes,
+    Decompressor(dictionary=None)      .decompress(data, max_length=-1) -> bytes,
                                        .eof, .needs_input, .unused_data
                                        (bz2/lzma-style incremental decompressor)
-    FrameReader(fp, read_size, write_size)
+    FrameReader(fp, read_size, write_size, dictionary=None)
                                        pull-style reader of one zstd frame from a
                                        binary file object: .read() returns at most
                                        ``write_size`` bytes, b"" at the end; after
@@ -48,8 +53,19 @@ except ImportError:  # pragma: no cover - depends on the interpreter
 if _impl is not None:
     ZstdError = _impl.ZstdError
 
-    def compress(data: bytes, level: int) -> bytes:
-        return _impl.compress(data, level=level)
+    class Dictionary:
+        def __init__(self, content: bytes) -> None:
+            self.content = bytes(content)
+            self._d = _impl.ZstdDict(self.content)
+            self.zstd_id = int(self._d.dict_id)
+
+    def train(samples: list[bytes], size: int) -> bytes:
+        return bytes(_impl.train_dict(samples, size).dict_content)
+
+    def compress(data: bytes, level: int, dictionary: Dictionary | None = None) -> bytes:
+        if dictionary is None:
+            return _impl.compress(data, level=level)
+        return _impl.compress(data, level=level, zstd_dict=dictionary._d.as_digested_dict)
 
     class Compressor:
         def __init__(self, level: int) -> None:
@@ -61,13 +77,15 @@ if _impl is not None:
         def flush(self) -> bytes:
             return self._c.flush()
 
-    def Decompressor():  # noqa: N802 - mirrors a class constructor
-        return _impl.ZstdDecompressor()
+    def Decompressor(dictionary: Dictionary | None = None):  # noqa: N802 - mirrors a class constructor
+        if dictionary is None:
+            return _impl.ZstdDecompressor()
+        return _impl.ZstdDecompressor(zstd_dict=dictionary._d)
 
     class FrameReader:
-        def __init__(self, fp, read_size: int, write_size: int) -> None:
+        def __init__(self, fp, read_size: int, write_size: int, dictionary: Dictionary | None = None) -> None:
             self._fp = fp
-            self._d = _impl.ZstdDecompressor()
+            self._d = Decompressor(dictionary)
             self._read_size = read_size
             self._write_size = write_size
             self._ended = False
@@ -104,8 +122,19 @@ else:  # only used when neither the stdlib module nor the backport exists
 
     ZstdError = _zs.ZstdError
 
-    def compress(data: bytes, level: int) -> bytes:
-        return _zs.ZstdCompressor(level=level, write_content_size=True).compress(data)
+    class Dictionary:  # type: ignore[no-redef]
+        def __init__(self, content: bytes) -> None:
+            self.content = bytes(content)
+            self._d = _zs.ZstdCompressionDict(self.content)
+            self.zstd_id = int(self._d.dict_id())
+
+    def train(samples: list[bytes], size: int) -> bytes:
+        return bytes(_zs.train_dictionary(size, samples).as_bytes())
+
+    def compress(data: bytes, level: int, dictionary: Dictionary | None = None) -> bytes:
+        if dictionary is None:
+            return _zs.ZstdCompressor(level=level, write_content_size=True).compress(data)
+        return _zs.ZstdCompressor(level=level, dict_data=dictionary._d, write_content_size=True).compress(data)
 
     class Compressor:  # type: ignore[no-redef]
         def __init__(self, level: int) -> None:
@@ -126,8 +155,11 @@ else:  # only used when neither the stdlib module nor the backport exists
         size; streaming reads go through FrameReader, which is bounded.
         """
 
-        def __init__(self) -> None:
-            self._d = _zs.ZstdDecompressor().decompressobj()
+        def __init__(self, dictionary: Dictionary | None = None) -> None:
+            if dictionary is None:
+                self._d = _zs.ZstdDecompressor().decompressobj()
+            else:
+                self._d = _zs.ZstdDecompressor(dict_data=dictionary._d).decompressobj()
             self._pending = b""
             self._frame_done = False
             self.unused_data = b""
@@ -156,9 +188,10 @@ else:  # only used when neither the stdlib module nor the backport exists
             return out
 
     class FrameReader:  # type: ignore[no-redef]
-        def __init__(self, fp, read_size: int, write_size: int) -> None:
+        def __init__(self, fp, read_size: int, write_size: int, dictionary: Dictionary | None = None) -> None:
             # read_to_iter never yields more than write_size bytes at a time.
-            self._it = _zs.ZstdDecompressor().read_to_iter(fp, read_size=read_size, write_size=write_size)
+            d = _zs.ZstdDecompressor() if dictionary is None else _zs.ZstdDecompressor(dict_data=dictionary._d)
+            self._it = d.read_to_iter(fp, read_size=read_size, write_size=write_size)
             self.truncated = False  # zstandard does not report it; the size check catches it
             self.trailing = False
 

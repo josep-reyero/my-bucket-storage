@@ -10,6 +10,7 @@ Public:
     VersionInfo  list_versions() entries (current version and trash)
     ListResult   list() result: objects, common prefixes, truncation cursor
     BucketStats  stats() result
+    DictInfo     dictionaries() entries
 """
 
 from __future__ import annotations
@@ -111,6 +112,27 @@ class BucketStats:
     database_bytes: int  # bucket.sqlite plus its WAL file
     file_bytes: int  # bytes under blobs/ (as recorded)
     trash_days: int
+    dict_blobs: int = 0  # distinct contents compressed with a trained dictionary
+    dictionaries: int = 0  # dictionaries stored (they are inside the database)
+    dict_bytes: int = 0  # their size
+    active_dict: int | None = None  # the dictionary new small objects are compressed with
+    format: int = 2  # the bucket's on-disk format version
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DictInfo:
+    id: int  # the value of blobs.dict_id
+    zstd_id: int  # the dictionary ID written in each zstd frame
+    size: int  # bytes
+    created_at: int
+    samples: int  # objects it was trained on
+    prefix: str  # the key prefix the samples came from
+    active: bool  # new small objects are compressed with it
+    blobs: int  # stored contents that need it
+    stored_bytes: int  # their stored (compressed) size
 
     def to_dict(self) -> dict:
         return asdict(self)
