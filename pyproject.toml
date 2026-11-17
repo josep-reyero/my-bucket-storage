@@ -16,6 +16,11 @@ classifiers = [
     "Topic :: System :: Archiving :: Compression",
 ]
 
+[project.urls]
+Homepage = "https://github.com/josep-reyero/my-bucket-storage"
+Repository = "https://github.com/josep-reyero/my-bucket-storage"
+Issues = "https://github.com/josep-reyero/my-bucket-storage/issues"
+
 [project.scripts]
 mybucket = "mybucket.cli:main"
 
