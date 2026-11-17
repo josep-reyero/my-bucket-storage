@@ -5,11 +5,11 @@ your data back **without mybucket installed**, using only the `sqlite3` and
 `zstd` command-line tools. If anything here disagrees with the code, the code
 is wrong: please report it.
 
-Format version: **2** for buckets (`meta.format`, `PRAGMA user_version`);
-the store marker `mybucket-store.json` still says `{"format": 1}`, because
-the store directory layout did not change. Format 1 buckets (written by
-mybucket 0.1) are described by this same document minus the parts marked
-*format 2*; section 6 says how they are upgraded.
+Format version: **2** for buckets (`meta.format`, `PRAGMA user_version`).
+The store marker `mybucket-store.json` says `{"format": 1}`: the store
+directory layout has its own number. A format 1 bucket is described by this
+same document minus the parts marked *format 2* (no dictionaries, no
+frames); section 6 says how mybucket opens one.
 
 ## 1. Directory layout
 
@@ -176,9 +176,9 @@ blob file with flipped bits), mybucket replaces the stored bytes of that
 `blobs` row (and its `frames` rows) with the new, hash-checked ones; the
 file path stays the same.
 
-Blobs written by mybucket 0.1 keep their form after an upgrade: large ones
-are a single `codec = 1` frame or raw, without `frames` rows. They read
-exactly as before; a range read of one reads it whole to check it.
+The blobs of a format 1 bucket keep their form when it becomes format 2:
+large ones are a single `codec = 1` frame or raw, without `frames` rows. A
+range read of one reads it whole to check it.
 
 ### 2.4 `objects`: the current version of every key
 
@@ -297,8 +297,8 @@ U+061C, U+200B, U+200E, U+200F, U+202A-U+202E and U+2066-U+2069, the line
 and paragraph separators U+2028 and U+2029, and U+FEFF. There is no
 leading or trailing `/` and no empty segment. Every key is therefore a safe
 relative path: writing an object to `<dir>/<key>` can never leave `<dir>`
-or create a hidden file. Format 1 keys were the ASCII subset
-`A-Z a-z 0-9 . _ ~ @ + = , -` of these rules, so every format 1 key is valid.
+or create a hidden file. The keys of a format 1 bucket are in the ASCII
+subset `A-Z a-z 0-9 . _ ~ @ + = , -` of these rules, so every one is valid.
 
 Keys are stored as SQLite `TEXT` (UTF-8) and sorted by SQLite's default
 `BINARY` collation, which is byte order of the UTF-8, the same as Unicode
@@ -600,11 +600,11 @@ The manifest is replaced at the end of each export and describes the last
 one. `mybucket import` reads it, when present, to restore content types and
 metadata; its name starts with `.` so it is never a key.
 
-## 6. Upgrading from format 1
+## 6. Format 1 buckets
 
-mybucket 0.2 reads format 1 buckets as they are, and never changes a bucket
-it opens read-only. The first time it opens a format 1 bucket for writing,
-it upgrades it in **one SQLite transaction**:
+mybucket reads a format 1 bucket as it is, and never changes a bucket it
+opens read-only. The first time it opens a format 1 bucket for writing, it
+makes it format 2 in **one SQLite transaction**:
 
 ```sql
 -- the "format 2" statements of section 2.1 (CREATE TABLE dicts, CREATE TABLE frames, CREATE INDEX blobs_dict)
@@ -614,10 +614,10 @@ PRAGMA user_version = 2;
 
 Nothing else changes: no object, blob row or blob file is rewritten, so
 every format 1 object reads back byte for byte, and the recovery script of
-section 5.2 works before and after. A crash during the upgrade leaves the
-bucket in format 1. After it, mybucket 0.1 refuses the bucket ("uses format
-2"); it would otherwise see `codec = 2` and dictionary blobs it cannot read.
-Take a snapshot first if you may need to go back to 0.1.
+section 5.2 works on it either way. A crash during that transaction
+leaves the bucket in format 1. A reader that knows only format 1 refuses a
+format 2 bucket (section 7), since it could not read `codec = 2` or
+dictionary blobs.
 
 ## 7. Compatibility rules
 

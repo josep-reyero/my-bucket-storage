@@ -42,7 +42,7 @@ Unreferenced blobs are exactly::
     WHERE NOT EXISTS (SELECT 1 FROM objects o WHERE o.blob_id = b.id)
       AND NOT EXISTS (SELECT 1 FROM trash t WHERE t.blob_id = b.id)
 
-Format 1 buckets (written by mybucket 0.1) are read as they are. Opening one
+Format 1 buckets are read as they are. Opening one
 for writing upgrades it to format 2 in one transaction (``upgrade_db``): the
 two tables are added and ``format`` / ``user_version`` become 2. Nothing
 else changes, so every format 1 object reads back exactly as before; an

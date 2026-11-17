@@ -90,7 +90,7 @@ What the numbers say:
 
 - **Space.** The bucket uses about a quarter of the disk the plain files use,
   and about 30% less than compressing each file on its own with zstd -19.
-  Three things add up. Many small files no longer each round up to a 4 KiB
+  Three things add up. Many small files do not each round up to a 4 KiB
   block, since they live inline in one SQLite file. Identical documents
   (`device.json`, empty "not worn" days) are stored once. Level 19 works well
   on JSON with repeated field names. The JSON part alone (about 38 MiB)

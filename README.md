@@ -1,5 +1,8 @@
 # my-bucket-storage
 
+> **Consumer apps should ship APIs that let people consume their own data. People then set up their own
+> dashboards and own their data, in an AI-native, fully flexible way.**
+
 An S3-like object store for one person's apps that:
 
 - **is built to save disk space**: objects are compressed with zstd (unless
@@ -182,9 +185,10 @@ look like `type/subtype`.
   `mybucket cat/get --start N --end M`). Objects over 4 MiB are stored in
   independent 1 MiB zstd frames, each with its own SHA-256, so a range read
   decompresses and checks only the frames it touches. A range of a smaller
-  object reads and checks the whole object. A large object written by
-  `mybucket` 0.1 has no frames, so a stream or range of it reads the object
-  twice: once to check it, once to hand it out (`get()` reads it once).
+  object reads and checks the whole object. A large object of a format 1
+  bucket (docs/FORMAT.md, section 6) has no frames, so a stream or range of
+  it reads the object twice: once to check it, once to hand it out (`get()`
+  reads it once).
 
 ### Repairing damage
 
@@ -283,7 +287,7 @@ bucket, and prefixes are compared on the NFC key that is actually stored.
 Use `photos/public/` (with the `/`) for a folder: `photos/public` would also
 cover `public-old/...`. A bucket the profile may only read is opened
 read-only, even when the profile may write elsewhere (so it is never
-upgraded from format 1).
+changed).
 
 A connection whose grants on a bucket are all prefix-scoped never sees
 `stored_size` (it is `None` in put results, `head`, `list` and stream
@@ -330,7 +334,7 @@ with two safety rules:
 
 - nothing is deleted until the whole source listing has been read and the
   source confirmed it was complete. A listing that stops early, comes out of
-  order, or comes from an older remote `mybucket` that does not confirm
+  order, or comes from a remote `mybucket` that does not confirm
   completion deletes nothing;
 - at most half of the destination bucket's objects (under `--prefix`, but
   at least 10) are deleted per bucket. Above that nothing is deleted in that
@@ -600,23 +604,14 @@ Version 0.2. It is young: keep backups (`mybucket sync` to another machine).
 | export_dir / import_dir, docs/FORMAT.md recovery script | done |
 | Read-only mode, multi-process safety, crash tests | done |
 | `mybucket` command-line tool (`--json`, stable exit codes) | done |
-| Keys with spaces and UTF-8 (NFC) | 0.2 |
-| Range reads (framed large objects) | 0.2 |
-| Trained zstd dictionaries | 0.2 |
-| Remote access over SSH, access profiles | 0.2 |
-| `sync` between stores | 0.2 |
+| Keys with spaces and UTF-8 (NFC) | done |
+| Range reads (framed large objects) | done |
+| Trained zstd dictionaries | done |
+| Remote access over SSH, access profiles | done |
+| `sync` between stores | done |
 
 Tested on Python 3.12, 3.13 and 3.14 (3.14 with the standard library's
 `compression.zstd`).
-
-### Upgrading from 0.1
-
-`mybucket` 0.2 reads 0.1 stores as they are. The first time it opens a bucket
-for writing, it upgrades it to format 2 in one transaction that only adds
-two tables (nothing is rewritten); read-only opens never change it. After
-that `mybucket` 0.1 refuses the bucket, so upgrade every machine that writes
-to it (and take a snapshot first if you may need to go back). See
-[docs/FORMAT.md](docs/FORMAT.md#6-upgrading-from-format-1).
 
 ### Not planned
 
@@ -637,9 +632,9 @@ uv run python bench/bench_space.py
 
 This is one piece of a small family of projects that work together or on their own:
 
-- [my-easy-software](https://github.com/josep-reyero/my-easy-software): the framework: create, run, deploy and share small personal projects with the `mes` command.
-- [my-easy-ui](https://github.com/josep-reyero/my-easy-ui): dashboards: plain description files a person or their AI agent can reshape, served privately.
-- [fitdata](https://github.com/josep-reyero/fitdata): the first project built this way: a personal Garmin data archive with a command line for agents.
+- **[my-easy-software](https://github.com/josep-reyero/my-easy-software)**: the framework: create, run, deploy and share small personal projects with the `mes` command.
+- **[my-easy-ui](https://github.com/josep-reyero/my-easy-ui)**: dashboards: plain description files a person or their AI agent can reshape, served privately.
+- **[fitdata](https://github.com/josep-reyero/fitdata)**: the first project built this way: a personal Garmin data archive with a command line for agents.
 
 ## License
 

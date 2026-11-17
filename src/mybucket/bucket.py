@@ -24,7 +24,7 @@ Public (``Bucket``):
     dictionaries() -> list[DictInfo]
     trash_days (property), name, path, readonly, format, close()
 
-Opening a format 1 bucket (written by mybucket 0.1) for writing upgrades it
+Opening a format 1 bucket for writing upgrades it
 to format 2 first (schema.upgrade_db); read-only handles never change it.
 
 A Bucket handle belongs to one bucket directory. If another process deletes
